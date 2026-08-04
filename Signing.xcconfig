@@ -1,0 +1,13 @@
+// Tracked. Signing defaults, plus an optional hook for your own local settings.
+//
+// DEVELOPMENT_TEAM is your Apple Developer Team ID. It is deliberately empty here:
+// a real value ties the repo to one developer account and stops anyone else from
+// building. To set yours, create an untracked Local.xcconfig next to this file:
+//
+//     DEVELOPMENT_TEAM = ABCDE12345
+//
+// `#include?` (with the question mark) does nothing when that file is absent, so a
+// fresh clone builds without it — unsigned, which is fine for running the tests.
+DEVELOPMENT_TEAM =
+
+#include? "Local.xcconfig"
