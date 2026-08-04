@@ -1,4 +1,7 @@
 # Quick Blade
+<div align="center">
+<img src=".github/logo.svg" width="200" alt="Quick Blade logo"><br><br>
+</div>
 
 Quick Look previews for Laravel Blade templates. Select a `.blade.php` file in Finder, press Space, and you get the rendered page — layout resolved, compiled CSS applied — instead of a wall of raw directives.
 
