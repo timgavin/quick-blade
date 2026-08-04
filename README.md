@@ -7,7 +7,7 @@ More at [quickblade.app](https://quickblade.app).
 ## Install
 
 ```
-brew install --cask quick-blade
+brew install --cask timgavin/tap/quick-blade
 ```
 
 Then open Quick Blade once. macOS registers Quick Look extensions when the host app first launches, so this step isn't optional.
