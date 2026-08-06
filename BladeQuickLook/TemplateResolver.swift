@@ -105,6 +105,9 @@ struct TemplateResolver {
         } else {
             styleBlock = "\(faCSS)\n\(barePageBaseCSS)"
         }
+        // Class-gated dark rules in the inlined app CSS need the root element
+        // marked (see darkModeClassBridgeScript) — pointless without app CSS.
+        let bridgeScript = css != nil ? darkModeClassBridgeScript : ""
 
         let document = """
         <!DOCTYPE html>
@@ -115,6 +118,7 @@ struct TemplateResolver {
         <style>
         \(styleBlock)
         </style>
+        \(bridgeScript)
         </head>
         <body>
         <main class="qb-page">
@@ -1887,7 +1891,7 @@ struct TemplateResolver {
                 if let css = css {
                     let inlinedCSS = inlineCSSResources(css, projectRoot: projectRoot)
                     let darkModeBridge = buildDarkModeBridge(from: css)
-                    replacement = "<style>\n\(inlinedCSS)\n\(darkModeBridge)\n\(faCSS)\n\(jsFrameworkDefaults)\n</style>"
+                    replacement = "<style>\n\(inlinedCSS)\n\(darkModeBridge)\n\(faCSS)\n\(jsFrameworkDefaults)\n</style>\n\(darkModeClassBridgeScript)"
                 } else {
                     replacement = "<style>\n\(faCSS)\n\(jsFrameworkDefaults)\n</style>"
                 }
@@ -2087,6 +2091,17 @@ struct TemplateResolver {
     //
     // The compiled CSS uses [data-theme=dark] for dark mode (JS toggle).
     // Quick Look may not execute JS, so we bridge it with @media queries.
+
+    /// Compiled Tailwind/Flux dark variants are class-gated — `.dark` on <html>,
+    /// added at runtime by app JS that lives in the never-loaded Vite bundle — so
+    /// they are inert in a static preview and light utilities win (a `bg-zinc-50
+    /// dark:bg-zinc-950` header stayed light on an otherwise dark page). The
+    /// preview DOES run inline JS (FINDINGS §10), so mirror the system appearance
+    /// onto the root element and the class-gated rules activate. `data-theme` is
+    /// set too (only when absent) for apps whose dark selectors key on the
+    /// attribute rather than the class.
+    static let darkModeClassBridgeScript =
+        #"<script>if (window.matchMedia && matchMedia("(prefers-color-scheme: dark)").matches) { var qbRoot = document.documentElement; qbRoot.classList.add("dark"); if (!qbRoot.hasAttribute("data-theme")) qbRoot.setAttribute("data-theme", "dark"); }</script>"#
 
     private static func buildDarkModeBridge(from css: String) -> String {
         guard let darkRegex = try? NSRegularExpression(

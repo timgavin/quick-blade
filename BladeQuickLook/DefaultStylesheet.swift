@@ -9,13 +9,13 @@ struct DefaultStylesheet {
     /// Includes light-mode geometry + colors and dark-mode color overrides.
     static let fluxShimCSS = """
     [data-flux-card]{background:#fff;border:1px solid #e4e4e7;border-radius:.75rem;padding:1.5rem}
-    [data-flux-heading]{font-weight:600;color:#27272a;font-size:.875rem;line-height:1.4;margin:0}
+    [data-flux-heading]{font-weight:600;color:#27272a;font-size:.875rem;line-height:1.4}
     [data-flux-heading][data-flux-size="lg"]{font-size:1rem}
     [data-flux-heading][data-flux-size="xl"]{font-size:1.5rem;line-height:1.2}
-    [data-flux-subheading]{color:#71717a;font-size:.875rem;margin:0}
+    [data-flux-subheading]{color:#71717a;font-size:.875rem}
     [data-flux-text]{color:#52525b;font-size:.875rem;margin:.25rem 0}
     [data-flux-callout]{display:flex;gap:.625rem;border:1px solid #e4e4e7;border-radius:.75rem;padding:1rem;background:#fafafa}
-    [data-flux-callout-heading]{font-weight:600;color:#27272a;font-size:.875rem;margin:0}
+    [data-flux-callout-heading]{font-weight:600;color:#27272a;font-size:.875rem}
     [data-flux-field]{display:block;margin-bottom:1rem}
     [data-flux-label]{display:block;font-weight:500;font-size:.875rem;color:#3f3f46;margin-bottom:.375rem}
     [data-flux-description]{color:#71717a;font-size:.8125rem;margin:.25rem 0}

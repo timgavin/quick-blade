@@ -160,8 +160,8 @@ struct BladeTranspiler {
 
         // The preview simulates an authenticated, authorized, non-admin user:
         // @guest/@cannot/@admin keep their @else branch; @auth/@can/@canany keep
-        // their first branch. (Plain @if/@else still shows all branches — that
-        // happens in Phase 2 and is intentional.)
+        // their first branch. (Plain @if/@else keeps its FIRST branch — resolved
+        // in Phase 2 since 2026-08-06; before that all branches rendered.)
         // (?<!\w) on openers mirrors Blade's \B@ rule — an email domain like
         // sales@auth.io is literal text and must not open a block.
         result = resolveBranchDirective(result,
@@ -236,6 +236,18 @@ struct BladeTranspiler {
 
     private static func phase2_stripControlFlow(_ source: String) -> String {
         var result = source
+
+        // Plain @if resolves to its FIRST branch (2026-08-06, user-approved reversal
+        // of the old all-branches behavior): the preview simulates the positive state,
+        // consistent with literal ternaries, @auth, and @forelse. Showing every branch
+        // rendered alternative wrappers as SIBLINGS — e.g. a transaction row's
+        // @if/@else variants became two w-full children of one flex row, blowing the
+        // row out of its card. Runs after loop expansion, so each expanded copy
+        // resolves independently; the catch-alls below still sweep up stray tokens
+        // from unterminated blocks.
+        result = resolveBranchDirective(result,
+            openPattern: #"(?<![\w@])@if\s*"# + balancedParens,
+            closeToken: "endif", keepFirstBranch: true)
 
         // Conditionals — remove the directive line, keep content between
         result = regexReplace(result, pattern: #"@if\s*"# + balancedParens, with: "")
@@ -537,6 +549,21 @@ struct BladeTranspiler {
         result = regexReplaceWithCapture(result,
             pattern: #"\{\{\s*(?:QBITER\d+\s+)?__\(\s*"([^"]*)"\s*(?:,[\s\S]*?)?\)\s*\}\}"#,
             template: "$1")
+
+        // 2.5 Dynamic tag NAMES: <{{ $tag }} {{ $n }}="{{ $v }}" >{!! $inner !!}</{{ $tag }}>.
+        //     A template that builds tags out of echoes (a frontmatter <head> emitter) can't
+        //     be substituted — the tag name would become "#", which WebKit renders as literal
+        //     text (`<# ="" ="" >Sample >`) pushed to the top of the preview. Real Laravel
+        //     renders these as invisible head metadata, so drop the whole construct instead.
+        //     Paired form first — swallowing the inner text and, when the closing ">" of the
+        //     void-element case sits in a stripped @else branch, that stray ">" too — then
+        //     orphaned open/close tags. Bounds are anti-backtracking guards (house style).
+        let dynOpen = #"<\{\{[^{}]{0,256}+\}\}"#
+        let dynClose = #"</\{\{[^{}]{0,256}+\}\}\s*+>"#
+        result = regexReplace(result,
+            pattern: dynOpen + #"[\s\S]{0,4096}?"# + dynClose + #"(?:\s*+>)?"#, with: "")
+        result = regexReplace(result, pattern: dynOpen + attrRun + ">", with: "")
+        result = regexReplace(result, pattern: dynClose, with: "")
 
         // 3. Collect remaining variables and replace with placeholders
         var placeholders: [(id: String, expr: String, isRaw: Bool)] = []
@@ -1034,6 +1061,11 @@ struct BladeTranspiler {
         var depth = 0
         var elseTokenStart: Int? = nil
         var elseTokenEnd = 0
+        // First top-level @elseif OR @else — where the first branch ENDS. Tracked
+        // separately from elseTokenStart because `@if A @elseif B @else C @endif`
+        // must yield firstBranch = A (not A + the elseif chain) while elseBranch
+        // stays C for the keep-else callers (@guest/@cannot/@session).
+        var firstDividerStart: Int? = nil
         var cursor = start
         while cursor < ns.length {
             guard let m = tokenRegex.firstMatch(
@@ -1051,7 +1083,7 @@ struct BladeTranspiler {
             }
 
             if depth == 0 && token == closeToken {
-                let firstEnd = elseTokenStart ?? m.range.location
+                let firstEnd = firstDividerStart ?? m.range.location
                 let first = ns.substring(with: NSRange(location: start, length: firstEnd - start))
                 var elseBranch: String? = nil
                 if elseTokenStart != nil {
@@ -1064,11 +1096,18 @@ struct BladeTranspiler {
             if isOpener {
                 depth += 1
             } else if token == "else" {
-                if depth == 0 && elseTokenStart == nil {
-                    elseTokenStart = m.range.location
-                    elseTokenEnd = m.range.location + m.range.length
+                if depth == 0 {
+                    if firstDividerStart == nil { firstDividerStart = m.range.location }
+                    if elseTokenStart == nil {
+                        elseTokenStart = m.range.location
+                        elseTokenEnd = m.range.location + m.range.length
+                    }
                 }
-            } else if token != "elseif" {
+            } else if token == "elseif" {
+                if depth == 0 && firstDividerStart == nil {
+                    firstDividerStart = m.range.location
+                }
+            } else {
                 // some @end… that isn't our closeToken
                 depth = max(0, depth - 1)
             }

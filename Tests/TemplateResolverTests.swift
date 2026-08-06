@@ -125,6 +125,35 @@ final class TemplateResolverTests: XCTestCase {
         XCTAssertTrue(result.html.contains("url(data:image/png;base64,"), "root-relative CSS url was not inlined")
     }
 
+    // MARK: - Dark mode class bridge
+
+    // Compiled Tailwind/Flux dark variants are class-gated (`.dark` on <html>),
+    // normally added by app JS living in the never-loaded Vite bundle. The preview
+    // DOES run inline JS (FINDINGS §10), so when compiled CSS is inlined the
+    // resolver injects a script that mirrors the system appearance onto the root.
+    func testDarkClassBridgeScriptInjectedOnLayoutPath() throws {
+        let project = try FixtureProject()
+        try project.write("resources/views/components/layouts/app.blade.php",
+            "<!DOCTYPE html><html><head>@vite(['resources/css/app.css'])</head><body>{{ $slot }}</body></html>")
+        try project.write("public/build/assets/app-abc123.css",
+            ".dark\\:bg-zinc-950:where(.dark, .dark *){background:#09090b}")
+        let page = "<x-layouts.app><p>X</p></x-layouts.app>"
+        let pageURL = try project.write("resources/views/pages/test.blade.php", page)
+        let result = TemplateResolver.resolve(source: page, fileURL: pageURL)
+        XCTAssertTrue(result.html.contains("classList.add(\"dark\")"),
+                      "dark class bridge script missing on layout path")
+    }
+
+    func testDarkClassBridgeScriptInjectedOnBarePagePath() throws {
+        let project = try FixtureProject()
+        try project.write("public/build/assets/app-abc123.css", ".x{color:red}")
+        let page = "<div><p>Nested component</p></div>"
+        let pageURL = try project.write("resources/views/livewire/widget.blade.php", page)
+        let result = TemplateResolver.resolve(source: page, fileURL: pageURL)
+        XCTAssertTrue(result.html.contains("classList.add(\"dark\")"),
+                      "dark class bridge script missing on bare-page path")
+    }
+
     func testSingleQuotedImgSrcIsInlined() throws {
         let project = try FixtureProject()
         try project.write("resources/views/components/layouts/app.blade.php",

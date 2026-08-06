@@ -124,7 +124,12 @@ struct FakeData {
             return suffixed("Sample Item", iteration)
         case "description", "body", "content", "excerpt", "summary", "bio",
              "message", "text":
-            return suffixed("A short sample sentence used as stand-in preview text.", iteration)
+            // Deliberately short. The previous 54-char sentence overflowed compact
+            // list rows in Quick Look's WebKit: a nested-flex truncate row that
+            // Chrome shrinks correctly only partially shrinks there, pushing the
+            // row past its card by up to 35px at two-column widths (measured via
+            // headless WKWebView at 1024-1300px; this length fits at all widths).
+            return suffixed("Stand-in preview text.", iteration)
         case "city", "location", "place", "region", "area", "venue", "destination": return p.city
         case "company", "team", "organization", "organisation", "brand", "vendor",
              "store", "shop", "agency":

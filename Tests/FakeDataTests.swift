@@ -103,7 +103,7 @@ final class FakeDataTests: XCTestCase {
 
     func testDescriptionSentence() {
         XCTAssertEqual(FakeData.value(for: "$post->excerpt"),
-                       "A short sample sentence used as stand-in preview text.")
+                       "Stand-in preview text.")
     }
 
     func testSlugYieldsExampleURL() {

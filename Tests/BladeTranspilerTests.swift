@@ -37,11 +37,11 @@ final class BladeTranspilerTests: XCTestCase {
 
     // The critical nesting case: an inner @if's @else must not be mistaken
     // for the @auth block's own @else.
-    func testNestedIfElseInsideAuthKeepsBothIfBranches() {
+    func testNestedIfElseInsideAuthResolvesIndependently() {
         let src = "@auth @if($a)<p>A</p>@else<p>B</p>@endif @else<p>Guest</p>@endauth"
         let out = BladeTranspiler.transpile(src)
         XCTAssertTrue(out.contains("<p>A</p>"))
-        XCTAssertTrue(out.contains("<p>B</p>"))   // @if shows all branches by design
+        XCTAssertFalse(out.contains("<p>B</p>"))   // inner @if keeps its first branch
         XCTAssertFalse(out.contains("<p>Guest</p>"))
     }
 
@@ -71,10 +71,39 @@ final class BladeTranspilerTests: XCTestCase {
         XCTAssertTrue(out.contains("Normal"))
     }
 
-    func testPlainIfStillShowsAllBranches() {
+    // Plain @if/@else resolves to the FIRST branch (2026-08-06, user-approved
+    // reversal of the old all-branches behavior): the preview simulates the
+    // positive state, consistent with literal ternaries, @auth, and @forelse.
+    // Showing every branch rendered alternative wrappers as SIBLINGS — two
+    // w-full flex children side by side — blowing rows out of their cards.
+    func testPlainIfElseKeepsFirstBranchOnly() {
         let out = BladeTranspiler.transpile("@if($a)<p>A</p>@else<p>B</p>@endif")
         XCTAssertTrue(out.contains("<p>A</p>"))
-        XCTAssertTrue(out.contains("<p>B</p>"))
+        XCTAssertFalse(out.contains("<p>B</p>"), "got: \(out)")
+    }
+
+    func testIfElseifElseKeepsFirstBranchOnly() {
+        let out = BladeTranspiler.transpile("@if($a)<p>A</p>@elseif($b)<p>B</p>@else<p>C</p>@endif")
+        XCTAssertTrue(out.contains("<p>A</p>"))
+        XCTAssertFalse(out.contains("<p>B</p>"), "got: \(out)")
+        XCTAssertFalse(out.contains("<p>C</p>"), "got: \(out)")
+    }
+
+    func testNestedIfElseResolvesEachLevelToFirstBranch() {
+        let out = BladeTranspiler.transpile(
+            "@if($a)@if($b)<p>AB</p>@else<p>AX</p>@endif @else<p>C</p>@endif")
+        XCTAssertTrue(out.contains("<p>AB</p>"))
+        XCTAssertFalse(out.contains("<p>AX</p>"), "got: \(out)")
+        XCTAssertFalse(out.contains("<p>C</p>"), "got: \(out)")
+    }
+
+    // The transaction-row shape that motivated the change: alternative wrappers
+    // inside a flex row must yield ONE child, not two side-by-side siblings.
+    func testAlternativeWrapperBranchesYieldSingleFlexChild() {
+        let src = #"<div class="flex">@if($x)<div class="w-full">real</div>@else<a class="w-full">skeleton</a>@endif</div>"#
+        let out = BladeTranspiler.transpile(src)
+        XCTAssertTrue(out.contains("real"))
+        XCTAssertFalse(out.contains("skeleton"), "got: \(out)")
     }
 
     // Consecutive blocks: an earlier @if block must not swallow or block a
@@ -139,7 +168,7 @@ final class BladeTranspilerTests: XCTestCase {
 
     func testRawEchoInBodyGetsFakeValue() {
         let out = BladeTranspiler.transpile("<div>{!! $post->body !!}</div>")
-        XCTAssertTrue(out.contains("A short sample sentence"), "got: \(out)")
+        XCTAssertTrue(out.contains("Stand-in preview text."), "got: \(out)")
     }
 
     func testBodyEchoUnknownYieldsSample() {
@@ -308,6 +337,27 @@ final class BladeTranspilerTests: XCTestCase {
         XCTAssertFalse(out.contains("data-flux-generic"))
     }
 
+    // MARK: - Shim CSS must not defeat app spacing utilities
+
+    // Tailwind v4 spacing utilities (space-y-*) are emitted inside :where() — zero
+    // specificity — so ANY attribute-selector margin in the shim silently beats
+    // them. Real Flux styles headings via utility classes (no data-attribute
+    // rules), so space-y works on real pages; the shim must not fight it. The
+    // heading shim elements are <div>s with no UA margin, so they need no margin
+    // reset at all. Regression: [data-flux-heading]{margin:0} rendered a
+    // space-y-6 card's heading flush against its first row while a sibling card
+    // whose heading sat in a plain <div> spaced correctly.
+    func testShimHeadingRulesCarryNoMargins() {
+        let rules = ["[data-flux-heading]", "[data-flux-subheading]", "[data-flux-callout-heading]"]
+        for selector in rules {
+            for line in DefaultStylesheet.fluxShimCSS.split(separator: "\n")
+            where line.hasPrefix(selector) {
+                XCTAssertFalse(line.contains("margin"),
+                               "\(selector) must not set margin — it defeats :where()-wrapped spacing utilities: \(line)")
+            }
+        }
+    }
+
     // MARK: - Preview doctrine: no validation errors
 
     func testErrorBlocksDropWithContent() {
@@ -325,5 +375,58 @@ final class BladeTranspilerTests: XCTestCase {
     func testNonErrorLoopWithMessageVariableStillExpands() {
         let out = BladeTranspiler.transpile("@foreach($items as $message)<li>ROW</li>@endforeach")
         XCTAssertEqual(out.components(separatedBy: "ROW").count - 1, 3, "got: \(out)")
+    }
+
+    // MARK: - Dynamic tag names (frontmatter head emitters)
+
+    // A layout that builds <head> tags from data — <{{ $tag }} {{ $name }}="{{ $value }}"> —
+    // can't be evaluated statically, and substituting its echoes produced visible junk
+    // (`<# ="" ="" >Sample >`) at the top of the preview. Such constructs are metadata
+    // emitters that render nothing visible in real Laravel, so drop them entirely.
+
+    func testDynamicTagPairWithInnerContentIsDropped() {
+        let src = "<{{ $tag }}\n{{ $name }}=\"{{ $value }}\"\n>{!! $inner !!}</{{ $tag }}>"
+        let out = BladeTranspiler.transpile(src)
+        XCTAssertEqual(out.trimmingCharacters(in: .whitespacesAndNewlines), "", "got: \(out)")
+    }
+
+    func testDynamicOpenTagAloneIsDropped() {
+        let src = "<{{ $tag }}\n{{ $name }}=\"{{ $value }}\"\n>"
+        let out = BladeTranspiler.transpile(src)
+        XCTAssertEqual(out.trimmingCharacters(in: .whitespacesAndNewlines), "", "got: \(out)")
+    }
+
+    func testOrphanDynamicCloseTagIsDropped() {
+        let out = BladeTranspiler.transpile("</{{ $tag }}>")
+        XCTAssertEqual(out.trimmingCharacters(in: .whitespacesAndNewlines), "", "got: \(out)")
+    }
+
+    func testHeadEmitterLoopShapeLeavesNoVisibleJunk() {
+        // The real-world shape (a $page->head frontmatter emitter): loop + conditional
+        // close, whose @else supplies the bare ">" for the void-element case. After loop
+        // expansion and control-flow stripping nothing visible may remain.
+        let src = """
+        @foreach ($page->head as $entry)
+        <{{ $tag }}
+        @foreach ($attributes as $name => $value)
+        {{ $name }}="{{ $value }}"
+        @endforeach
+        @if ($inner !== null)
+        >{!! $inner !!}</{{ $tag }}>
+        @else
+        >
+        @endif
+        @endforeach
+        """
+        let out = BladeTranspiler.transpile(src)
+        XCTAssertEqual(out.trimmingCharacters(in: .whitespacesAndNewlines), "", "got: \(out)")
+    }
+
+    func testStaticTagWithDynamicAttrsIsUntouched() {
+        // Only a dynamic tag NAME triggers the drop — a normal tag with echo
+        // attributes keeps its existing behavior (href echo → inert "#").
+        let out = BladeTranspiler.transpile("<a href=\"{{ $url }}\">{{ $label }}</a>")
+        XCTAssertTrue(out.contains("<a href=\"#\">"), "got: \(out)")
+        XCTAssertTrue(out.contains("</a>"))
     }
 }
