@@ -38,8 +38,8 @@ targets:
         PRODUCT_NAME: "Quick Blade"
         INFOPLIST_KEY_CFBundleDisplayName: "Quick Blade"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
-        MARKETING_VERSION: "1.0.0"
-        CURRENT_PROJECT_VERSION: "1"
+        MARKETING_VERSION: "1.0.1"
+        CURRENT_PROJECT_VERSION: "2"
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_LSApplicationCategoryType: "public.app-category.developer-tools"
     dependencies:
@@ -61,8 +61,8 @@ targets:
         CODE_SIGN_ENTITLEMENTS: BladeQuickLook/BladeQuickLook.entitlements
         PRODUCT_BUNDLE_IDENTIFIER: com.quickblade.QuickBlade.BladeQuickLook
         PRODUCT_NAME: BladeQuickLook
-        MARKETING_VERSION: "1.0.0"
-        CURRENT_PROJECT_VERSION: "1"
+        MARKETING_VERSION: "1.0.1"
+        CURRENT_PROJECT_VERSION: "2"
         GENERATE_INFOPLIST_FILE: NO
         INFOPLIST_FILE: BladeQuickLook/Info.plist
         SWIFT_EMIT_LOC_STRINGS: "YES"
@@ -81,8 +81,8 @@ targets:
         CODE_SIGN_ENTITLEMENTS: BladeThumbnail/BladeThumbnail.entitlements
         PRODUCT_BUNDLE_IDENTIFIER: com.quickblade.QuickBlade.BladeThumbnail
         PRODUCT_NAME: BladeThumbnail
-        MARKETING_VERSION: "1.0.0"
-        CURRENT_PROJECT_VERSION: "1"
+        MARKETING_VERSION: "1.0.1"
+        CURRENT_PROJECT_VERSION: "2"
         GENERATE_INFOPLIST_FILE: NO
         INFOPLIST_FILE: BladeThumbnail/Info.plist
         SWIFT_VERSION: "5.0"

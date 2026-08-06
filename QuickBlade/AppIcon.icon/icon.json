@@ -7,7 +7,7 @@
       "layers" : [
         {
           "fill" : {
-            "solid" : "display-p3:1.00000,0.25098,0.27843,1.00000"
+            "solid" : "srgb:0.96078,0.18824,0.01176,1.00000"
           },
           "image-name" : "QuickBlade Logo.svg",
           "name" : "QuickBlade Logo",

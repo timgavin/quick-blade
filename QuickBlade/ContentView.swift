@@ -1,8 +1,11 @@
 import SwiftUI
 
 struct ContentView: View {
-    // Brand red (#FF4047) — same Display P3 components as the AppIcon.icon glyph fill
-    private static let brandRed = Color(.displayP3, red: 1.0, green: 0.25098, blue: 0.27843)
+    // Brand red (#F53003) — Laravel's current brand red (laravel.com site palette),
+    // in sRGB on purpose: the previous Display P3 red read visibly hotter than the
+    // web color. The AppIcon.icon glyph still carries the old #FF4047 until the
+    // icon artwork is re-exported.
+    private static let brandRed = Color(.sRGB, red: 0.96078, green: 0.18824, blue: 0.01176)
 
     // nil = still checking, .some(nil) = undeterminable, .some(.some(x)) = known
     @State private var status: ExtensionStatus?? = nil
