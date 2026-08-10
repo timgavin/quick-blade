@@ -58,3 +58,7 @@ For a quick smoke test, build, launch the app once, then `qlmanage -p TestFiles/
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+The MIT license covers the code. It doesn't license the name "Quick Blade", the logo, or the app icon — those are mine. If you fork it, use your own name and artwork.
+
+And please don't sell it. MIT lets you, so that's a request rather than a rule, but Quick Blade is free and I'd like it to stay that way.
