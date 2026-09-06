@@ -181,6 +181,62 @@ final class TemplateResolverTests: XCTestCase {
                       "bare page needs a dark ground: \(result.html.prefix(1200))")
     }
 
+    // MARK: - color-scheme declaration (dark-mode white flash)
+
+    // Without a color-scheme declaration WebKit treats the document as light and
+    // paints a white canvas until a body background lands — a white flash on every
+    // preview in dark mode. Declare it on every document we emit.
+    func testBarePageDeclaresColorScheme() throws {
+        let project = try FixtureProject()
+        let page = "<div><p>Nested component</p></div>"
+        let pageURL = try project.write("resources/views/livewire/widget.blade.php", page)
+        let result = TemplateResolver.resolve(source: page, fileURL: pageURL)
+        XCTAssertTrue(result.html.contains(#"<meta name="color-scheme" content="light dark">"#), "meta missing")
+        XCTAssertTrue(result.html.contains("color-scheme: light dark"), "root property missing")
+    }
+
+    func testLayoutPathDeclaresColorSchemeWhenAppCSSIsSchemeAware() throws {
+        let project = try FixtureProject()
+        try project.write("resources/views/components/layouts/app.blade.php",
+            "<!DOCTYPE html><html><head>@vite(['resources/css/app.css'])</head><body>{{ $slot }}</body></html>")
+        try project.write("public/build/manifest.json",
+            #"{"resources/css/app.css":{"file":"assets/app-abc.css","src":"resources/css/app.css","isEntry":true}}"#)
+        try project.write("public/build/assets/app-abc.css", ".x{color:red}.dark .x{color:pink}")
+        let page = "<x-layouts.app><p>x</p></x-layouts.app>"
+        let pageURL = try project.write("resources/views/pages/test.blade.php", page)
+        let result = TemplateResolver.resolve(source: page, fileURL: pageURL)
+        XCTAssertTrue(result.html.contains(#"<meta name="color-scheme" content="light dark">"#), "meta missing")
+        XCTAssertTrue(result.html.contains("color-scheme: light dark"), "root property missing")
+    }
+
+    func testLayoutPathLeavesLightOnlyAppAlone() throws {
+        // Under color-scheme: dark WebKit's default text is white; a light-only app
+        // with no explicit body color would render white on white. Don't touch it.
+        let project = try FixtureProject()
+        try project.write("resources/views/components/layouts/app.blade.php",
+            "<!DOCTYPE html><html><head>@vite(['resources/css/app.css'])</head><body>{{ $slot }}</body></html>")
+        try project.write("public/build/manifest.json",
+            #"{"resources/css/app.css":{"file":"assets/app-abc.css","src":"resources/css/app.css","isEntry":true}}"#)
+        try project.write("public/build/assets/app-abc.css", ".x{color:red}")
+        let page = "<x-layouts.app><p>x</p></x-layouts.app>"
+        let pageURL = try project.write("resources/views/pages/test.blade.php", page)
+        let result = TemplateResolver.resolve(source: page, fileURL: pageURL)
+        XCTAssertFalse(result.html.contains(#"name="color-scheme""#), "must not declare a scheme for a light-only app")
+    }
+
+    func testLayoutPathDoesNotDuplicateAnExistingColorSchemeMeta() throws {
+        let project = try FixtureProject()
+        try project.write("resources/views/components/layouts/app.blade.php",
+            #"<!DOCTYPE html><html><head><meta name="color-scheme" content="dark light">@vite(['resources/css/app.css'])</head><body>{{ $slot }}</body></html>"#)
+        try project.write("public/build/manifest.json",
+            #"{"resources/css/app.css":{"file":"assets/app-abc.css","src":"resources/css/app.css","isEntry":true}}"#)
+        try project.write("public/build/assets/app-abc.css", ".x{color:red}.dark .x{color:pink}")
+        let page = "<x-layouts.app><p>x</p></x-layouts.app>"
+        let pageURL = try project.write("resources/views/pages/test.blade.php", page)
+        let result = TemplateResolver.resolve(source: page, fileURL: pageURL)
+        XCTAssertEqual(result.html.components(separatedBy: #"name="color-scheme""#).count - 1, 1, "exactly one meta")
+    }
+
     func testDarkClassBridgeScriptInjectedOnBarePagePath() throws {
         let project = try FixtureProject()
         try project.write("public/build/assets/app-abc123.css", ".x{color:red}")

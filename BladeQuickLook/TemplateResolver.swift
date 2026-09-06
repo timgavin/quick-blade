@@ -115,6 +115,7 @@ struct TemplateResolver {
         <head>
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
+        \(colorSchemeMeta)
         <style>
         \(styleBlock)
         </style>
@@ -138,6 +139,7 @@ struct TemplateResolver {
     private static let barePageBaseCSS = """
     [x-show] { display: none !important; }
     [wire\\:loading],[wire\\:loading\\.flex],[wire\\:loading\\.block],[wire\\:loading\\.inline],[wire\\:loading\\.inline-flex],[wire\\:loading\\.grid],[wire\\:loading\\.table],[wire\\:loading\\.delay]{display:none!important}
+    \(colorSchemeCSS)
     html { background: #fff; }
     body { margin: 0; color: #27272a; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Helvetica, Arial, sans-serif; }
     @media (prefers-color-scheme: dark) { html { background: #18181b; } body { color: #e4e4e7; } }
@@ -1893,7 +1895,17 @@ struct TemplateResolver {
                 if let css = css {
                     let inlinedCSS = inlineCSSResources(css, projectRoot: projectRoot)
                     let darkModeBridge = buildDarkModeBridge(from: css)
-                    replacement = "<style>\n\(inlinedCSS)\n\(darkModeBridge)\n\(faCSS)\n\(jsFrameworkDefaults)\n</style>\n\(darkModeClassBridgeScript)"
+                    // Declare the colour scheme so WebKit paints a dark canvas in dark mode
+                    // instead of flashing white until a body background lands — but only
+                    // for a scheme-aware app: under color-scheme:dark the UA default text is
+                    // white, and a light-only app with no explicit body colour would render
+                    // white on white. Skip the meta if the layout already carries one.
+                    let schemeAware = css.contains("prefers-color-scheme") || css.contains(".dark")
+                    let hasMeta = result.range(of: #"<meta\s[^>]*name\s*=\s*["']color-scheme["']"#,
+                                               options: .regularExpression) != nil
+                    let schemeMeta = schemeAware && !hasMeta ? colorSchemeMeta + "\n" : ""
+                    let schemeCSS = schemeAware ? colorSchemeCSS + "\n" : ""
+                    replacement = "\(schemeMeta)<style>\n\(inlinedCSS)\n\(darkModeBridge)\n\(faCSS)\n\(jsFrameworkDefaults)\n\(schemeCSS)</style>\n\(darkModeClassBridgeScript)"
                 } else {
                     replacement = "<style>\n\(faCSS)\n\(jsFrameworkDefaults)\n</style>"
                 }
@@ -2102,6 +2114,11 @@ struct TemplateResolver {
     /// onto the root element and the class-gated rules activate. `data-theme` is
     /// set too (only when absent) for apps whose dark selectors key on the
     /// attribute rather than the class.
+    /// Tells WebKit the document supports both schemes, so in dark mode the canvas is painted
+    /// dark from the first frame (no white flash) and form controls/scrollbars render dark.
+    static let colorSchemeMeta = #"<meta name="color-scheme" content="light dark">"#
+    static let colorSchemeCSS = ":root { color-scheme: light dark; }"
+
     static let darkModeClassBridgeScript =
         #"<script>if (window.matchMedia && matchMedia("(prefers-color-scheme: dark)").matches) { var qbRoot = document.documentElement; qbRoot.classList.add("dark"); if (!qbRoot.hasAttribute("data-theme")) qbRoot.setAttribute("data-theme", "dark"); }</script>"#
 

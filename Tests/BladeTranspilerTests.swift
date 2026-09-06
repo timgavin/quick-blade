@@ -445,6 +445,12 @@ final class BladeTranspilerTests: XCTestCase {
                       "bare pages must show modals as a panel")
     }
 
+    func testFallbackWrapDeclaresColorScheme() {
+        let out = DefaultStylesheet.wrap(content: "<p>x</p>", filename: "f.blade.php")
+        XCTAssertTrue(out.contains(#"<meta name="color-scheme" content="light dark">"#), "got: \(out.prefix(400))")
+        XCTAssertTrue(out.contains("color-scheme: light dark"), "root property missing")
+    }
+
     func testFallbackWrapPutsContentInsideBarePageContainer() {
         let out = DefaultStylesheet.wrap(content: "<p>x</p>", filename: "f.blade.php")
         XCTAssertTrue(out.contains("<main class=\"qb-page\">"), "got: \(out)")

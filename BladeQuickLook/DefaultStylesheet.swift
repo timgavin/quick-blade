@@ -150,7 +150,9 @@ struct DefaultStylesheet {
         <head>
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
+        \(TemplateResolver.colorSchemeMeta)
         <style>
+        \(TemplateResolver.colorSchemeCSS)
         :root {
             --bg: #FFFFFF;
             --fg: #1C1C1E;
