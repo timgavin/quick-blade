@@ -144,6 +144,43 @@ final class TemplateResolverTests: XCTestCase {
                       "dark class bridge script missing on layout path")
     }
 
+    // x-cloak only hides an element until Alpine initialises; at rest it is visible.
+    // Hiding it in the preview blanked whole widgets (a heart button whose every
+    // icon carried x-cloak rendered as an empty button).
+    func testXCloakIsNotHiddenOnLayoutPath() throws {
+        let project = try FixtureProject()
+        try project.write("resources/views/components/layouts/app.blade.php",
+            "<!DOCTYPE html><html><head>@vite(['resources/css/app.css'])</head><body>{{ $slot }}</body></html>")
+        try project.write("public/build/manifest.json",
+            #"{"resources/css/app.css":{"file":"assets/app-abc.css","src":"resources/css/app.css","isEntry":true}}"#)
+        try project.write("public/build/assets/app-abc.css", ".x{color:red}")
+        let page = "<x-layouts.app><i x-cloak>x</i></x-layouts.app>"
+        let pageURL = try project.write("resources/views/pages/test.blade.php", page)
+        let result = TemplateResolver.resolve(source: page, fileURL: pageURL)
+        XCTAssertTrue(result.html.contains("[x-show]"), "precondition: Alpine defaults were injected")
+        XCTAssertFalse(result.html.contains("[x-cloak]"), "x-cloak must not be hidden")
+    }
+
+    func testXCloakIsNotHiddenOnBarePagePath() throws {
+        let project = try FixtureProject()
+        let page = "<div><i x-cloak>x</i></div>"
+        let pageURL = try project.write("resources/views/livewire/widget.blade.php", page)
+        let result = TemplateResolver.resolve(source: page, fileURL: pageURL)
+        XCTAssertTrue(result.html.contains("[x-show]"), "precondition: Alpine defaults were injected")
+        XCTAssertFalse(result.html.contains("[x-cloak]"), "x-cloak must not be hidden")
+    }
+
+    // The bridge script switches the app's `dark:` utilities on, so a bare component
+    // page must not keep a hardcoded white ground and dark text under them.
+    func testBarePageGroundFollowsColorScheme() throws {
+        let project = try FixtureProject()
+        let page = "<div><p>Nested component</p></div>"
+        let pageURL = try project.write("resources/views/livewire/widget.blade.php", page)
+        let result = TemplateResolver.resolve(source: page, fileURL: pageURL)
+        XCTAssertTrue(result.html.contains("@media (prefers-color-scheme: dark) { html { background: #18181b; } body { color: #e4e4e7; } }"),
+                      "bare page needs a dark ground: \(result.html.prefix(1200))")
+    }
+
     func testDarkClassBridgeScriptInjectedOnBarePagePath() throws {
         let project = try FixtureProject()
         try project.write("public/build/assets/app-abc123.css", ".x{color:red}")

@@ -429,4 +429,318 @@ final class BladeTranspilerTests: XCTestCase {
         XCTAssertTrue(out.contains("<a href=\"#\">"), "got: \(out)")
         XCTAssertTrue(out.contains("</a>"))
     }
+
+    // MARK: - Modals: hidden on composed pages, shown on bare-component pages
+
+    // A full page's modal is closed at rest, so hiding it is right there. But a
+    // view that IS a modal (a Livewire dialog component) previewed as a blank
+    // page — the transpiled markup was fine and one shim rule hid all of it.
+    // Bare-component and fallback renders wrap content in <main class="qb-page">;
+    // inside that container the modal renders as a visible panel.
+    func testShimHidesModalsExceptInsideBarePageContainer() {
+        let lines = DefaultStylesheet.fluxShimCSS.split(separator: "\n").map(String.init)
+        XCTAssertTrue(lines.contains { $0.hasPrefix("[data-flux-modal]{") && $0.contains("display:none") },
+                      "composed pages must still hide modals")
+        XCTAssertTrue(lines.contains { $0.hasPrefix(".qb-page [data-flux-modal]{") && $0.contains("display:block") },
+                      "bare pages must show modals as a panel")
+    }
+
+    func testFallbackWrapPutsContentInsideBarePageContainer() {
+        let out = DefaultStylesheet.wrap(content: "<p>x</p>", filename: "f.blade.php")
+        XCTAssertTrue(out.contains("<main class=\"qb-page\">"), "got: \(out)")
+        XCTAssertTrue(out.contains("<p>x</p>"))
+    }
+
+    // MARK: - Avatars carry content instead of an empty gray circle
+
+    func testFluxAvatarWithSrcRendersPlaceholderImage() {
+        let out = BladeTranspiler.transpile(#"<flux:avatar circle size="xl" src="{{ $user['avatar'] }}" alt="{{ $user['name'] }}" />"#)
+        XCTAssertTrue(out.contains("<span data-flux-avatar"), "got: \(out)")
+        XCTAssertTrue(out.contains("data-flux-size=\"xl\""), "got: \(out)")
+        XCTAssertTrue(out.contains("data-flux-circle"), "got: \(out)")
+        XCTAssertTrue(out.contains("<img src=\"data:image/svg+xml"), "got: \(out)")
+        XCTAssertFalse(out.contains("{{"), "echo leaked: \(out)")
+    }
+
+    func testFluxAvatarWithBoundSrcRendersPlaceholderImage() {
+        let out = BladeTranspiler.transpile(#"<flux:avatar :src="$user->avatar_url" />"#)
+        XCTAssertTrue(out.contains("<img src=\"data:image/svg+xml"), "got: \(out)")
+        XCTAssertFalse(out.contains("avatar_url"), "bound expression leaked: \(out)")
+    }
+
+    func testFluxAvatarWithStaticNameRendersInitials() {
+        let out = BladeTranspiler.transpile(#"<flux:avatar name="Jane Doe" />"#)
+        XCTAssertTrue(out.contains(">JD<"), "got: \(out)")
+        XCTAssertFalse(out.contains("<img"), "got: \(out)")
+    }
+
+    func testFluxAvatarWithSingleWordNameRendersTwoLetterInitials() {
+        // Mirrors Flux: one word → first letter upper, second letter lower.
+        let out = BladeTranspiler.transpile(#"<flux:avatar name="alex" />"#)
+        XCTAssertTrue(out.contains(">Al<"), "got: \(out)")
+    }
+
+    func testFluxAvatarWithInitialsAttrUsesThem() {
+        let out = BladeTranspiler.transpile(#"<flux:avatar initials="TG" />"#)
+        XCTAssertTrue(out.contains(">TG<"), "got: \(out)")
+    }
+
+    func testFluxAvatarWithDynamicNameRendersPlaceholderImage() {
+        // Initials can't be computed from an echo; fall back to the image placeholder.
+        let out = BladeTranspiler.transpile(#"<flux:avatar name="{{ $user->name }}" />"#)
+        XCTAssertTrue(out.contains("<img src=\"data:image/svg+xml"), "got: \(out)")
+        XCTAssertFalse(out.contains("{{"), "echo leaked: \(out)")
+    }
+
+    func testFluxAvatarWithNoSourceStaysEmpty() {
+        let out = BladeTranspiler.transpile(#"<flux:avatar />"#)
+        XCTAssertTrue(out.contains("<span data-flux-avatar></span>"), "got: \(out)")
+    }
+
+    func testShimSizesAvatarsLikeFlux() {
+        // Flux avatar/index.blade.php: xs size-6, sm size-8, md size-10, lg size-12, xl size-16.
+        let css = DefaultStylesheet.fluxShimCSS
+        for (size, rem) in [("xs", "1.5rem"), ("sm", "2rem"), ("lg", "3rem"), ("xl", "4rem")] {
+            XCTAssertTrue(css.contains("[data-flux-avatar][data-flux-size=\"\(size)\"]{width:\(rem);height:\(rem)}"),
+                          "missing \(size) avatar size rule")
+        }
+        XCTAssertTrue(css.contains("[data-flux-avatar] img{"), "avatar image must fill the avatar")
+    }
+
+    // MARK: - Shim layout fixes found on real component views
+
+    func testFluxCheckboxRowIsNotTheSwitchRow() {
+        // The switch row is space-between (label left, toggle far right). A checkbox
+        // with a label was reusing it, pushing "Publish" to the far edge of the page.
+        let out = BladeTranspiler.transpile(#"<flux:checkbox wire:model="published" label="Publish" />"#)
+        XCTAssertTrue(out.contains("data-flux-check-row"), "got: \(out)")
+        XCTAssertFalse(out.contains("data-flux-control-row"), "got: \(out)")
+        let rule = DefaultStylesheet.fluxShimCSS.split(separator: "\n")
+            .first { $0.hasPrefix("[data-flux-check-row]{") }
+        XCTAssertNotNil(rule, "missing check-row shim rule")
+        XCTAssertFalse(rule?.contains("space-between") ?? true, "check row must not be space-between: \(rule ?? "")")
+    }
+
+    func testFluxSwitchStillUsesControlRow() {
+        let out = BladeTranspiler.transpile(#"<flux:switch wire:model="dark" label="Dark mode" />"#)
+        XCTAssertTrue(out.contains("data-flux-control-row"), "got: \(out)")
+    }
+
+    // MARK: - Alpine event attributes survive the directive catch-all
+
+    // Alpine's `@click="…"` shorthand is not a Blade directive (Blade leaves an
+    // unregistered @word alone). The catch-all stripped the name and left a
+    // nameless `="…"` attribute; a `=>` inside the handler then closed the tag
+    // early in the browser and the rest of the attributes rendered as page text.
+    func testAlpineEventAttributeKeepsItsName() {
+        let out = BladeTranspiler.transpile(#"<button @click="open = !open" class="c">Go</button>"#)
+        XCTAssertTrue(out.contains(#"@click="open = !open""#), "got: \(out)")
+    }
+
+    func testAlpineEventAttributeWithModifiersKeepsItsName() {
+        let out = BladeTranspiler.transpile(#"<div @keydown.escape.window="close()" @click.outside="close()">x</div>"#)
+        XCTAssertTrue(out.contains(#"@keydown.escape.window="close()""#), "got: \(out)")
+        XCTAssertTrue(out.contains(#"@click.outside="close()""#), "got: \(out)")
+    }
+
+    func testAlpineHandlerWithArrowFunctionDoesNotBreakTheTag() {
+        let out = BladeTranspiler.transpile(#"<button @click="setTimeout(() => a = false, 800)" title="Follow">Hi</button>"#)
+        XCTAssertTrue(out.contains(#"@click="setTimeout(() => a = false, 800)""#), "got: \(out)")
+        XCTAssertTrue(out.contains(#"title="Follow">Hi</button>"#), "got: \(out)")
+    }
+
+    func testStandaloneUnknownDirectiveIsStillStripped() {
+        let out = BladeTranspiler.transpile("<p>@customThing after</p>")
+        XCTAssertTrue(out.contains("<p> after</p>"), "got: \(out)")
+    }
+
+    // MARK: - Echo context survives a > inside an earlier attribute value
+
+    func testEchoAfterArrowInAttributeIsStillTagContext() {
+        // The tag scanner used to stop at the first raw `>`, so an echo after an
+        // arrow function was classified as body text and got a fake sentence.
+        let out = BladeTranspiler.transpile(#"<a @click="x => go(x)" href="{{ route('home') }}">L</a>"#)
+        XCTAssertTrue(out.contains("href=\"#\""), "got: \(out)")
+    }
+
+    func testBareAttributesBagInTagVanishes() {
+        // `{{ $attributes }}` bare inside a tag has no visual form; it used to
+        // become a stray `#` attribute.
+        let out = BladeTranspiler.transpile(#"<button {{ $attributes }} class="c">Go</button>"#)
+        XCTAssertFalse(out.contains("#"), "got: \(out)")
+        XCTAssertTrue(out.contains(#"class="c">Go</button>"#), "got: \(out)")
+    }
+
+    // MARK: - Alpine resting state: negated x-show is the visible branch
+
+    // Alpine never runs in a preview, so every x-show element is hidden by CSS.
+    // Toggle state almost always starts false (open: false, animating: false), so
+    // the branch shown at rest is the NEGATED one. Strip x-show from those so the
+    // CSS rule leaves them alone; plain x-show="open" stays hidden.
+    func testNegatedXShowElementIsShown() {
+        let out = BladeTranspiler.transpile(#"<span x-show="!open">Closed</span><span x-show="open">Open</span>"#)
+        XCTAssertTrue(out.contains("<span>Closed</span>"), "got: \(out)")
+        XCTAssertTrue(out.contains(#"<span x-show="open">Open</span>"#), "got: \(out)")
+    }
+
+    func testNegatedXShowWithSpaceIsShown() {
+        let out = BladeTranspiler.transpile(#"<div x-show="! $wire.isSubscriberOnly" class="c">x</div>"#)
+        XCTAssertTrue(out.contains(#"<div class="c">x</div>"#), "got: \(out)")
+    }
+
+    func testXCloakAttributeIsRemoved() {
+        // Apps ship `[x-cloak]{display:none!important}` in their own compiled CSS, which
+        // no preview stylesheet can override — so do what Alpine does on init: drop it.
+        let out = BladeTranspiler.transpile(#"<i x-cloak class="c">x</i><div x-cloak>y</div>"#)
+        XCTAssertTrue(out.contains(#"<i class="c">x</i>"#), "got: \(out)")
+        XCTAssertTrue(out.contains("<div>y</div>"), "got: \(out)")
+    }
+
+    func testInequalityXShowIsNotANegation() {
+        let out = BladeTranspiler.transpile(#"<div x-show="a != b">x</div>"#)
+        XCTAssertTrue(out.contains(#"x-show="a != b""#), "got: \(out)")
+    }
+
+    // MARK: - @props defaults fill bare prop echoes
+
+    // A component previewed on its own has no caller, so its props are unset. The
+    // literal defaults in @props([...]) are the author's own "typical" values and
+    // beat both fake data and the empty string (a `fa-{{ $size }}` class used to
+    // lose its size entirely).
+    func testPropsDefaultFillsEchoInsideClassAttribute() {
+        let out = BladeTranspiler.transpile(#"@props(['size' => 'lg'])<i class="fa fa-{{ $size }}"></i>"#)
+        XCTAssertTrue(out.contains(#"class="fa fa-lg""#), "got: \(out)")
+    }
+
+    func testPropsDefaultFillsEchoInBody() {
+        let out = BladeTranspiler.transpile(#"@props(['title' => 'Hello there'])<h1>{{ $title }}</h1>"#)
+        XCTAssertTrue(out.contains("<h1>Hello there</h1>"), "got: \(out)")
+    }
+
+    func testPropsDoubleQuotedAndMultilineDefaults() {
+        let src = """
+        @props([
+            "isActive" => false,
+            "size" => "lg",
+            "count" => 3,
+            "identifier" => null,
+        ])
+        <span class="a-{{ $size }}">{{ $count }}|{{ $isActive }}</span>
+        """
+        let out = BladeTranspiler.transpile(src)
+        XCTAssertTrue(out.contains(#"class="a-lg""#), "got: \(out)")
+        XCTAssertTrue(out.contains(">3|</span>"), "false echoes as empty, like PHP: \(out)")
+    }
+
+    func testPropsNullDefaultFallsBackToFakeData() {
+        let out = BladeTranspiler.transpile(#"@props(['title' => null])<h1>{{ $title }}</h1>"#)
+        XCTAssertFalse(out.contains("<h1></h1>"), "got: \(out)")
+        XCTAssertFalse(out.contains("null"), "got: \(out)")
+    }
+
+    func testPropsWithoutDefaultsFallsBackToFakeData() {
+        let out = BladeTranspiler.transpile(#"@props(['title'])<h1>{{ $title }}</h1>"#)
+        XCTAssertFalse(out.contains("<h1></h1>"), "got: \(out)")
+    }
+
+    func testPropsDefaultDoesNotApplyToExpressions() {
+        // Only a bare `{{ $prop }}` is resolvable statically; leave method chains alone.
+        let out = BladeTranspiler.transpile(#"@props(['size' => 'lg'])<p>{{ $size->label() }}</p>"#)
+        XCTAssertFalse(out.contains("<p>lg</p>"), "got: \(out)")
+    }
+
+    func testPropsDefaultIsHTMLEscaped() {
+        let out = BladeTranspiler.transpile(#"@props(['title' => 'a <b> & c'])<h1>{{ $title }}</h1>"#)
+        XCTAssertTrue(out.contains("<h1>a &lt;b&gt; &amp; c</h1>"), "got: \(out)")
+    }
+
+    // MARK: - if-family closers are interchangeable
+
+    // Blade compiles @endif / @endunless / @endisset / @endempty all to `endif;`, so
+    // an @if closed by @endisset is valid Blade. The scanner only accepted the exact
+    // closer, treated the block as unterminated, and rendered every branch — three
+    // avatar images piled into one 3rem box.
+    func testIfClosedByEndissetStillResolvesToOneBranch() {
+        let out = BladeTranspiler.transpile("@if ($a)<p>A</p>@else<p>B</p>@endisset")
+        XCTAssertTrue(out.contains("<p>A</p>"), "got: \(out)")
+        XCTAssertFalse(out.contains("<p>B</p>"), "got: \(out)")
+    }
+
+    func testNestedIssetInsideIfElseStillNests() {
+        let out = BladeTranspiler.transpile("@if ($a)<p>A</p>@else @isset($b)<p>B</p>@else<p>C</p>@endisset @endif")
+        XCTAssertTrue(out.contains("<p>A</p>"), "got: \(out)")
+        XCTAssertFalse(out.contains("<p>B</p>") || out.contains("<p>C</p>"), "got: \(out)")
+    }
+
+    // MARK: - @if and ternaries decided by @props defaults
+
+    // With a declared default the condition is knowable: `@if ($isAuthUser)` with
+    // `'isAuthUser' => false` is the ELSE branch. Without a usable default the
+    // first-branch rule still applies.
+    func testIfOnFalsePropDefaultKeepsElseBranch() {
+        let out = BladeTranspiler.transpile("@props(['isAuthUser' => false])@if ($isAuthUser)<p>ME</p>@else<p>THEM</p>@endif")
+        XCTAssertTrue(out.contains("<p>THEM</p>"), "got: \(out)")
+        XCTAssertFalse(out.contains("<p>ME</p>"), "got: \(out)")
+    }
+
+    func testNegatedIfOnFalsePropDefaultKeepsFirstBranch() {
+        let out = BladeTranspiler.transpile("@props(['isAuthUser' => false])@if (! $isAuthUser)<p>THEM</p>@endif@if ($isAuthUser)<p>ME</p>@endif")
+        XCTAssertTrue(out.contains("<p>THEM</p>"), "got: \(out)")
+        XCTAssertFalse(out.contains("<p>ME</p>"), "got: \(out)")
+    }
+
+    func testIfEqualityAgainstPropDefault() {
+        let out = BladeTranspiler.transpile("@props(['variant' => 'default'])@if ($variant === 'warning')<p>W</p>@else<p>D</p>@endif")
+        XCTAssertTrue(out.contains("<p>D</p>"), "got: \(out)")
+        XCTAssertFalse(out.contains("<p>W</p>"), "got: \(out)")
+    }
+
+    func testIfEmptyOfStringPropDefault() {
+        let out = BladeTranspiler.transpile("@props(['u' => 'tim'])@if (! empty($u))<p>Y</p>@else<p>N</p>@endif")
+        XCTAssertTrue(out.contains("<p>Y</p>"), "got: \(out)")
+        XCTAssertFalse(out.contains("<p>N</p>"), "got: \(out)")
+    }
+
+    func testIfOnPropWithoutDefaultKeepsFirstBranch() {
+        let out = BladeTranspiler.transpile("@props(['body'])@if (! empty($body))<p>Y</p>@else<p>N</p>@endif")
+        XCTAssertTrue(out.contains("<p>Y</p>"), "got: \(out)")
+    }
+
+    func testIfOnComplexConditionKeepsFirstBranch() {
+        let out = BladeTranspiler.transpile("@props(['n' => 3])@if ($n > 2 && $other)<p>Y</p>@else<p>N</p>@endif")
+        XCTAssertTrue(out.contains("<p>Y</p>"), "got: \(out)")
+    }
+
+    func testTernaryOnFalsePropDefaultTakesElseValue() {
+        let out = BladeTranspiler.transpile(#"@props(['isAuthUser' => false])<div class="flex {{ $isAuthUser ? 'justify-end' : 'justify-start' }}">x</div>"#)
+        XCTAssertTrue(out.contains(#"class="flex justify-start""#), "got: \(out)")
+    }
+
+    func testTernaryOnTruePropDefaultTakesFirstValue() {
+        let out = BladeTranspiler.transpile(#"@props(['big' => true])<p class="{{ $big ? 'lg' : 'sm' }}">x</p>"#)
+        XCTAssertTrue(out.contains(#"class="lg""#), "got: \(out)")
+    }
+
+    func testTernaryWithUnknownConditionStillTakesFirstValue() {
+        let out = BladeTranspiler.transpile(#"<p class="{{ $big ? 'lg' : 'sm' }}">x</p>"#)
+        XCTAssertTrue(out.contains(#"class="lg""#), "got: \(out)")
+    }
+
+    // MARK: - Empty image sources
+
+    // A bound prop that resolves to nothing (`:avatar="$userAvatar"` with a null
+    // default) leaves `<img src="">`, which renders as a broken-image icon.
+    func testEmptyImgSrcGetsPlaceholder() {
+        let out = BladeTranspiler.transpile(#"<img src="" alt="" class="h-10 w-10"><img src='' alt="">"#)
+        XCTAssertFalse(out.contains(#"src="""#) || out.contains("src=''"), "got: \(out)")
+        XCTAssertEqual(out.components(separatedBy: "src=\"data:image/svg+xml").count - 1, 2, "got: \(out)")
+    }
+
+    func testShimNavbarItemIsAPositioningContext() {
+        // Apps hang notification badges off nav items with Tailwind `absolute`; without
+        // position:relative on the item the badge anchors to the page corner instead.
+        let rule = DefaultStylesheet.fluxShimCSS.split(separator: "\n")
+            .first { $0.hasPrefix("[data-flux-navbar-item]{") }
+        XCTAssertTrue(rule?.contains("position:relative") ?? false, "got: \(rule ?? "no rule")")
+    }
 }

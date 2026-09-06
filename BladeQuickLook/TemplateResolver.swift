@@ -137,10 +137,10 @@ struct TemplateResolver {
     // rules win, guaranteeing a readable container regardless of the app's own body styles.
     private static let barePageBaseCSS = """
     [x-show] { display: none !important; }
-    [x-cloak] { display: none !important; }
     [wire\\:loading],[wire\\:loading\\.flex],[wire\\:loading\\.block],[wire\\:loading\\.inline],[wire\\:loading\\.inline-flex],[wire\\:loading\\.grid],[wire\\:loading\\.table],[wire\\:loading\\.delay]{display:none!important}
     html { background: #fff; }
-    body { margin: 0; background: #fff; color: #27272a; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Helvetica, Arial, sans-serif; }
+    body { margin: 0; color: #27272a; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Helvetica, Arial, sans-serif; }
+    @media (prefers-color-scheme: dark) { html { background: #18181b; } body { color: #e4e4e7; } }
     .qb-page { max-width: 72rem; margin: 0 auto; padding: 2rem; }
     \(DefaultStylesheet.fluxShimCSS)
     """
@@ -1880,9 +1880,11 @@ struct TemplateResolver {
             let matches = viteRegex.matches(in: result, options: [], range: range)
 
             if !matches.isEmpty {
-                // Alpine.js elements with x-show start hidden (JS toggles them).
-                // Without JS, hide them so the preview matches the initial page state.
-                let jsFrameworkDefaults = "[x-show] { display: none !important; }\n[x-cloak] { display: none !important; }\n"
+                // Alpine.js elements with x-show start hidden (JS toggles them). Without JS,
+                // hide them so the preview matches the initial page state — except negated
+                // ones, which BladeTranspiler.resolveAlpineRestingState already unmarked.
+                // x-cloak is NOT hidden: Alpine removes it on init, so at rest it is visible.
+                let jsFrameworkDefaults = "[x-show] { display: none !important; }\n"
                     + "[wire\\:loading],[wire\\:loading\\.flex],[wire\\:loading\\.block],[wire\\:loading\\.inline],[wire\\:loading\\.inline-flex],[wire\\:loading\\.grid],[wire\\:loading\\.table],[wire\\:loading\\.delay]{display:none!important}\n"
                     + DefaultStylesheet.fluxShimCSS
 

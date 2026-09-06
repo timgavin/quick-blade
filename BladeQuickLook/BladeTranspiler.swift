@@ -23,17 +23,48 @@ struct BladeTranspiler {
         // templates (Flux uses the `Flux::` facade + `@blaze`), so we rewrite the tags to
         // native elements carrying `data-flux-*` hooks that the shim stylesheet styles.
         result = expandNamespacedComponents(result)
+        // Read @props defaults before Phase 1 strips the directive; Phase 3 uses them.
+        let propDefaults = parsePropsDefaults(result)
         result = phase1_stripInvisible(result)
         result = expandLoops(result)
-        result = phase2_stripControlFlow(result)
-        result = phase3_replaceVariables(result)
+        result = phase2_stripControlFlow(result, propDefaults: propDefaults)
+        result = phase3_replaceVariables(result, propDefaults: propDefaults)
         result = phase4_replaceIncludes(result)
+        result = resolveAlpineRestingState(result)
+        result = fillEmptyImageSources(result)
         result = phase5_cleanWhitespace(result)
         // Restore Blade's @@ escape (literal @) after all directive/variable processing.
         result = result.replacingOccurrences(of: "QUICKBLADE_AT_", with: "@")
         result = restoreStyleBlocks(result, blocks: styleBlocks)
         result = restoreVerbatimBlocks(result, blocks: verbatimBlocks)
         return result
+    }
+
+    // MARK: - Alpine resting state
+
+    /// Alpine never runs in a preview, so the stylesheet hides every `[x-show]` element.
+    /// Toggle state almost always starts false (`open: false`, `animating: false`), which
+    /// makes the NEGATED branch (`x-show="!open"`) the one visible at rest. Drop the
+    /// attribute from those elements so the CSS rule leaves them alone; a plain
+    /// `x-show="open"` keeps its attribute and stays hidden. `!=` is not a negation.
+    ///
+    /// `x-cloak` is removed outright, as Alpine does on init: apps ship
+    /// `[x-cloak]{display:none!important}` in their own compiled CSS, which no preview
+    /// stylesheet can override, and at rest a cloaked element is visible.
+    private static func resolveAlpineRestingState(_ source: String) -> String {
+        var result = regexReplace(source, pattern: #"\s+x-show\s*=\s*(?:"\s*!(?!=)[^"]*"|'\s*!(?!=)[^']*')"#, with: "")
+        result = regexReplace(result, pattern: #"\s+x-cloak(?:\s*=\s*(?:"[^"]*"|'[^']*'))?(?=[\s/>])"#, with: "")
+        return result
+    }
+
+    // MARK: - Empty image sources
+
+    /// `<img src="">` renders as a broken-image icon. It appears when a bound prop resolves
+    /// to nothing (`:avatar="$userAvatar"` with a null default); show the neutral placeholder.
+    private static func fillEmptyImageSources(_ source: String) -> String {
+        regexReplace(source,
+                     pattern: #"(<img\b"# + attrRun + #"?\ssrc\s*=\s*)(?:""|'')"#,
+                     with: "$1\"\(imagePlaceholderDataURI)\"")
     }
 
     // MARK: - Style Block Extraction (performance)
@@ -234,7 +265,7 @@ struct BladeTranspiler {
 
     // MARK: - Phase 2: Strip control flow (remove directives, keep content)
 
-    private static func phase2_stripControlFlow(_ source: String) -> String {
+    private static func phase2_stripControlFlow(_ source: String, propDefaults: [String: String] = [:]) -> String {
         var result = source
 
         // Plain @if resolves to its FIRST branch (2026-08-06, user-approved reversal
@@ -245,9 +276,17 @@ struct BladeTranspiler {
         // row out of its card. Runs after loop expansion, so each expanded copy
         // resolves independently; the catch-alls below still sweep up stray tokens
         // from unterminated blocks.
+        // When the condition is a simple test of a prop with a declared default
+        // (`$isAuthUser`, `! $x`, `$variant === 'warning'`, `empty($u)`), it is
+        // knowable, and the matching branch is kept instead of the first one.
         result = resolveBranchDirective(result,
             openPattern: #"(?<![\w@])@if\s*"# + balancedParens,
-            closeToken: "endif", keepFirstBranch: true)
+            closeToken: "endif", keepFirstBranch: true,
+            decide: { opener in
+                guard let l = opener.firstIndex(of: "("), let r = opener.lastIndex(of: ")"), l < r
+                else { return nil }
+                return evaluatePropCondition(String(opener[opener.index(after: l)..<r]), defaults: propDefaults)
+            })
 
         // Conditionals — remove the directive line, keep content between
         result = regexReplace(result, pattern: #"@if\s*"# + balancedParens, with: "")
@@ -302,7 +341,11 @@ struct BladeTranspiler {
         let cssAtRules = #"(?!font|media|keyframes|import|charset|supports|layer|property|page|namespace|counter|container|scope|tailwind|apply)"#
         result = regexReplace(result, pattern: "(?<!\\w)@" + cssAtRules + #"[a-zA-Z]+\s*"# + balancedParens, with: "")
         result = regexReplace(result, pattern: #"(?<!\w)@end[a-zA-Z]+"#, with: "")
-        result = regexReplace(result, pattern: "(?<!\\w)@" + cssAtRules + #"[a-zA-Z]+(?!\w)"#, with: "")
+        // Not Alpine's `@click="…"` / `@keydown.escape.window="…"` event shorthand: an
+        // @word followed (through optional .modifiers) by `=` is an HTML attribute, not
+        // a directive — Blade itself leaves an unregistered @word alone. Stripping the
+        // name left a nameless `="…"` attribute whose `=>` then closed the tag early.
+        result = regexReplace(result, pattern: "(?<!\\w)@" + cssAtRules + #"[a-zA-Z]+(?!\w)(?![\w.:\-]*\s*=)"#, with: "")
 
         return result
     }
@@ -500,7 +543,100 @@ struct BladeTranspiler {
     // a styled <span> (in body text). This avoids the problem where
     // expressions like $user->name contain ">" which breaks tag-matching.
 
-    private static func phase3_replaceVariables(_ source: String) -> String {
+    /// Literal defaults declared in `@props([...])`, keyed by prop name. A component previewed
+    /// on its own has no caller, so its props are unset; the author's defaults are the best
+    /// "typical" values available and beat fake data. Only scalars are read — strings,
+    /// numbers, true/false. `null`, arrays, closures and expressions are skipped so the echo
+    /// falls through to the normal fake-data path. Nested arrays are not parsed, so an entry
+    /// inside one can be picked up if it happens to share a prop's name.
+    static func parsePropsDefaults(_ source: String) -> [String: String] {
+        guard let propsRegex = cachedRegex(#"@props\s*"# + balancedParens),
+              let entryRegex = cachedRegex(
+                #"['"]([A-Za-z_]\w*)['"]\s*=>\s*(?:'((?:[^'\\]|\\.)*)'|"((?:[^"\\]|\\.)*)"|(-?\d+(?:\.\d+)?)|(true|false))"#)
+        else { return [:] }
+        let ns = source as NSString
+        guard let props = propsRegex.firstMatch(in: source, options: [], range: NSRange(location: 0, length: ns.length))
+        else { return [:] }
+        let body = ns.substring(with: props.range)
+        let bodyNS = body as NSString
+        var defaults: [String: String] = [:]
+        for m in entryRegex.matches(in: body, options: [], range: NSRange(location: 0, length: bodyNS.length)) {
+            let name = bodyNS.substring(with: m.range(at: 1))
+            func group(_ i: Int) -> String? {
+                m.range(at: i).location == NSNotFound ? nil : bodyNS.substring(with: m.range(at: i))
+            }
+            let value: String
+            if let s = group(2) ?? group(3) {
+                value = s.replacingOccurrences(of: #"\\(['"\\])"#, with: "$1", options: .regularExpression)
+            } else if let n = group(4) {
+                value = n
+            } else if let b = group(5) {
+                value = b == "true" ? "1" : ""   // PHP echoes true as "1", false as ""
+            } else {
+                continue
+            }
+            if defaults[name] == nil { defaults[name] = value }
+        }
+        return defaults
+    }
+
+    /// Evaluates a Blade condition against declared prop defaults. Handles the shapes that
+    /// gate component markup in practice — `$p`, `! $p`, `empty($p)`, `isset($p)`, and
+    /// `$p ===|!==|==|!= <literal>` — with PHP truthiness ("" and "0" are false). Anything
+    /// else, or a prop with no usable default, is nil: unknown, so the caller's default rule
+    /// applies.
+    static func evaluatePropCondition(_ raw: String, defaults: [String: String]) -> Bool? {
+        guard !defaults.isEmpty else { return nil }
+        var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        while s.hasPrefix("("), s.hasSuffix(")") {
+            s = String(s.dropFirst().dropLast()).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        func truthy(_ v: String) -> Bool { !(v.isEmpty || v == "0") }
+
+        if s.hasPrefix("!"), !s.hasPrefix("!=") {
+            return evaluatePropCondition(String(s.dropFirst()), defaults: defaults).map { !$0 }
+        }
+        if let c = captures(s, #"^\$([A-Za-z_]\w*)$"#) {
+            return defaults[c[1]].map(truthy)
+        }
+        if let c = captures(s, #"^(empty|isset)\s*\(\s*\$([A-Za-z_]\w*)\s*\)$"#) {
+            guard let v = defaults[c[2]] else { return nil }
+            return c[1] == "empty" ? !truthy(v) : true
+        }
+        if let c = captures(s, #"^\$([A-Za-z_]\w*)\s*(===|!==|==|!=)\s*(?:'([^']*)'|"([^"]*)"|(-?\d+(?:\.\d+)?)|(true|false|null))$"#) {
+            guard let v = defaults[c[1]] else { return nil }
+            let literal: String
+            if c[6].isEmpty { literal = c[3] + c[4] + c[5] }   // exactly one of these matched
+            else { literal = c[6] == "true" ? "1" : "" }       // false/null echo as ""
+            let equal = v == literal
+            return c[2].hasPrefix("!") ? !equal : equal
+        }
+        return nil
+    }
+
+    /// Capture groups of the first match (unmatched groups are ""), or nil if no match.
+    private static func captures(_ s: String, _ pattern: String) -> [String]? {
+        guard let r = cachedRegex(pattern),
+              let m = r.firstMatch(in: s, options: [], range: NSRange(s.startIndex..., in: s)) else { return nil }
+        let ns = s as NSString
+        return (0..<m.numberOfRanges).map {
+            m.range(at: $0).location == NSNotFound ? "" : ns.substring(with: m.range(at: $0))
+        }
+    }
+
+    /// The literal default for a bare `{{ $prop }}` echo, or nil for any other expression.
+    private static func propDefault(for expr: String, in defaults: [String: String], isRaw: Bool) -> String? {
+        guard !defaults.isEmpty else { return nil }
+        // Loop-iteration tokens (`QBITER3 $x`) are prefixed by expandLoops; ignore them.
+        let bare = expr.replacingOccurrences(of: #"^QBITER\d+\s+"#, with: "", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard bare.hasPrefix("$"),
+              bare.dropFirst().range(of: #"^[A-Za-z_]\w*$"#, options: .regularExpression) != nil,
+              let value = defaults[String(bare.dropFirst())] else { return nil }
+        return isRaw ? value : DefaultStylesheet.escapeHTML(value)
+    }
+
+    private static func phase3_replaceVariables(_ source: String, propDefaults: [String: String] = [:]) -> String {
         var result = source
 
         // 0. FontAwesome weight is often picked by a Blade ternary inside class="…", e.g.
@@ -518,12 +654,13 @@ struct BladeTranspiler {
         // Runs AFTER the FA-weight rule, which deliberately keeps its ELSE branch.
         // [^{}?] before the `?` keeps a `??` null-coalesce from half-matching
         // as a ternary (see testNullCoalesceIsNotATernary).
-        result = regexReplaceWithCapture(result,
-            pattern: #"\{\{[^{}?]*\?\s*'([^']*)'\s*:\s*'[^']*'\s*\}\}"#,
-            template: "$1")
-        result = regexReplaceWithCapture(result,
-            pattern: #"\{\{[^{}?]*\?\s*"([^"]*)"\s*:\s*"[^"]*"\s*\}\}"#,
-            template: "$1")
+        // …unless the condition tests a prop with a declared default, which decides it.
+        for pattern in [#"\{\{([^{}?]*)\?\s*'([^']*)'\s*:\s*'([^']*)'\s*\}\}"#,
+                        #"\{\{([^{}?]*)\?\s*"([^"]*)"\s*:\s*"([^"]*)"\s*\}\}"#] {
+            result = regexReplaceWithBlock(result, pattern: pattern) { caps in
+                evaluatePropCondition(caps[1], defaults: propDefaults) == false ? caps[3] : caps[2]
+            }
+        }
 
         // 1. @{{ }} — Vue/Alpine escaped syntax. The author wants the LITERAL {{ }} to
         //    survive into the preview, so park it in a placeholder the variable collectors
@@ -592,13 +729,22 @@ struct BladeTranspiler {
         //    step 7 applies them all.
         var imgSrcIDs = Set<String>()
         for ph in placeholders {
+            let declared = propDefault(for: ph.expr, in: propDefaults, isRaw: ph.isRaw)
             switch contexts[ph.id] ?? .body {
             case .body:
-                substitutions[ph.id] = FakeData.value(for: ph.expr)
+                substitutions[ph.id] = declared ?? FakeData.value(for: ph.expr)
             case .tagUnquoted:
                 substitutions[ph.id] = "#"
+            case .tagBare:
+                // Almost always `{{ $attributes }}` — an attribute bag with no visual
+                // form. "#" left a stray attribute on every component root.
+                substitutions[ph.id] = ""
             case .quotedAttr(let name, let tag):
-                if fakeValueAttrs.contains(name) {
+                // A declared default wins in any attribute except an <img src>, whose
+                // literal path can't be loaded from a preview anyway.
+                if let declared, !(name == "src" && tag == "img") {
+                    substitutions[ph.id] = declared
+                } else if fakeValueAttrs.contains(name) {
                     substitutions[ph.id] = FakeData.value(for: ph.expr)
                 } else if name == "src", tag == "img" {
                     // The echo may be only PART of the src value (e.g. a literal
@@ -672,7 +818,8 @@ struct BladeTranspiler {
 
     private enum PlaceholderContext {
         case body                                  // outside any tag → fake value
-        case tagUnquoted                           // inside a tag, not in a quoted attr → "#"
+        case tagUnquoted                           // unquoted attr value `name={{ }}` → "#"
+        case tagBare                               // bare token in a tag ({{ $attributes }}) → ""
         case quotedAttr(name: String, tag: String) // inside a quoted attr of <tag …>
     }
 
@@ -727,10 +874,12 @@ struct BladeTranspiler {
         _ source: String,
         placeholders: [(id: String, expr: String, isRaw: Bool)]
     ) -> [String: PlaceholderContext] {
+        // Quote-aware tag match: a `>` inside a quoted value (an Alpine `() =>` handler)
+        // must not end the tag, or every echo after it is misread as body text.
         guard !placeholders.isEmpty,
-              let tagRegex = cachedRegex(#"<[a-zA-Z][^>]*>"#),
+              let tagRegex = cachedRegex("<[a-zA-Z]" + attrRun + ">"),
               let tokenRegex = cachedRegex(placeholderTokenPattern),
-              let attrRegex = cachedRegex(#"([\w:.\-]+)\s*=\s*(?:"[^"]*+"|'[^']*+')"#)
+              let attrRegex = cachedRegex(#"([\w:.\-@]+)\s*=\s*(?:"[^"]*+"|'[^']*+')"#)
         else { return [:] }
 
         var contexts: [String: PlaceholderContext] = [:]
@@ -758,7 +907,15 @@ struct BladeTranspiler {
                     token.range.location >= $0.range.location
                         && token.range.location < $0.range.location + $0.range.length
                 }
-                contexts[id] = owner.map { .quotedAttr(name: $0.name, tag: tagName) } ?? .tagUnquoted
+                if let owner {
+                    contexts[id] = .quotedAttr(name: owner.name, tag: tagName)
+                } else {
+                    // `name={{ $x }}` (unquoted value) vs. a bare `{{ $attributes }}` token:
+                    // only the former has `=` immediately before it.
+                    let before = tagNS.substring(to: token.range.location)
+                    let isValue = before.range(of: #"=\s*$"#, options: .regularExpression) != nil
+                    contexts[id] = isValue ? .tagUnquoted : .tagBare
+                }
             }
         }
         return contexts
@@ -936,9 +1093,11 @@ struct BladeTranspiler {
                 ? "<div data-flux-control-row><div>\(labelHTML)\(descHTML)</div>\(toggle)</div>"
                 : toggle
         case "checkbox", "radio":
+            // Not the switch's control-row: that is space-between (toggle on the far
+            // right), which pushed a checkbox's label to the far edge of the page.
             let box = "<input type=\"\(lower)\" data-flux-\(lower)>"
             return (label != nil || desc != nil)
-                ? "<div data-flux-control-row>\(box)<div>\(labelHTML)\(descHTML)</div></div>"
+                ? "<div data-flux-check-row>\(box)<div>\(labelHTML)\(descHTML)</div></div>"
                 : box
         case "input", "textarea", "select":
             let control: String
@@ -958,13 +1117,71 @@ struct BladeTranspiler {
         case "spacer":
             return "<div data-flux-spacer></div>"
         case "avatar":
-            return "<span data-flux-avatar></span>"
+            return fluxAvatar(attrs: attrs, classAttr: classAttr)
         default:
             let el = fluxElement(name)
             // Unknown self-closing components carry no content — drop them entirely.
             if el.attr == "data-flux-generic" { return "" }
             return "<\(el.tag) \(el.attr)\(classAttr)></\(el.tag)>"
         }
+    }
+
+    /// Neutral person silhouette shown where an avatar has an image we can't load
+    /// (the `src` is almost always a runtime URL). Distinct from the empty gray disc
+    /// so an avatar row reads as people, not as missing content.
+    static let avatarPlaceholderDataURI =
+        "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' fill='%23e4e4e7'/%3E%3Ccircle cx='32' cy='24' r='12' fill='%23a1a1aa'/%3E%3Cpath d='M8 60c2-14 12-20 24-20s22 6 24 20z' fill='%23a1a1aa'/%3E%3C/svg%3E"
+
+    /// `<flux:avatar>` → a sized, optionally circular span carrying either a placeholder
+    /// image (any `src`/`:src`, or a name we can't read statically) or Flux-style
+    /// initials (static `initials`, else derived from a static `name`). Mirrors
+    /// flux/avatar/index.blade.php: two words → first letters of the first two,
+    /// one word → first letter upper + second lower.
+    private static func fluxAvatar(attrs: String, classAttr: String) -> String {
+        var open = "<span data-flux-avatar"
+        if let v = attrValue("size", in: attrs) { open += " data-flux-size=\"\(v)\"" }
+        if hasAttribute("circle", in: attrs) { open += " data-flux-circle" }
+        open += classAttr + ">"
+
+        let isEcho = { (v: String) in v.contains("{{") || v.contains("{!!") }
+        let hasImage = hasAttribute("src", in: attrs)
+        let initialsAttr = attrValue("initials", in: attrs)
+        let nameAttr = attrValue("name", in: attrs)
+        let hasDynamicName = hasAttribute("name", in: attrs)
+            && (nameAttr == nil || isEcho(nameAttr!))
+
+        var content = ""
+        if let i = initialsAttr, !isEcho(i) {
+            content = i
+        } else if let n = nameAttr, !isEcho(n), let derived = initials(fromName: n) {
+            content = derived
+        } else if hasImage || hasDynamicName || (initialsAttr.map(isEcho) ?? false) {
+            content = "<img src=\"\(avatarPlaceholderDataURI)\" alt=\"\">"
+        }
+        return open + content + "</span>"
+    }
+
+    private static func initials(fromName name: String) -> String? {
+        let parts = name.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+        guard let first = parts.first, !first.isEmpty else { return nil }
+        if parts.count >= 2, let second = parts[1].first {
+            return String(first.prefix(1)).uppercased() + String(second).uppercased()
+        }
+        let chars = Array(first)
+        let head = String(chars[0]).uppercased()
+        let tail = chars.count > 1 ? String(chars[1]).lowercased() : ""
+        return head + tail
+    }
+
+    /// True if `name` appears as an attribute in any form — static (`src="…"`), bound
+    /// (`:src="…"`), or boolean (`circle`). Unlike attrValue, this only asks whether the
+    /// attribute is present, so a bound value still counts.
+    private static func hasAttribute(_ name: String, in attrs: String) -> Bool {
+        // Blank quoted values first so a word inside a value (`alt="{{ $user['name'] }}"`,
+        // `class="circle"`) can't pass as an attribute.
+        let names = regexReplace(attrs, pattern: #""[^"]*"|'[^']*'"#, with: "\"\"")
+        guard let r = cachedRegex(#"(?<![\w.\-])(?::)?"# + name + #"(?![\w\-])"#) else { return false }
+        return r.firstMatch(in: names, options: [], range: NSRange(names.startIndex..., in: names)) != nil
     }
 
     /// Reads a static attribute value (double- or single-quoted). The lookbehind rejects
@@ -1013,11 +1230,16 @@ struct BladeTranspiler {
     /// block's own. `openPattern` must match the opening directive including any
     /// (...) argument. Unterminated blocks are left untouched (Phase 2's
     /// catch-all still strips the stray tokens).
+    private static let ifFamilyClosers: Set<String> = ["endif", "endunless", "endisset", "endempty"]
+
+    /// `decide` may inspect the matched opener (e.g. `@if ($isAuthUser)`) and return which
+    /// branch to keep; nil falls back to `keepFirstBranch`.
     private static func resolveBranchDirective(
         _ source: String,
         openPattern: String,
         closeToken: String,
-        keepFirstBranch: Bool
+        keepFirstBranch: Bool,
+        decide: ((String) -> Bool?)? = nil
     ) -> String {
         guard let openRegex = cachedRegex(openPattern) else { return source }
         var result = source
@@ -1039,7 +1261,8 @@ struct BladeTranspiler {
                 searchLocation = bodyStart
                 continue
             }
-            let kept = keepFirstBranch ? parsed.firstBranch : (parsed.elseBranch ?? "")
+            let keep = decide?(ns.substring(with: open.range)) ?? keepFirstBranch
+            let kept = keep ? parsed.firstBranch : (parsed.elseBranch ?? "")
             let full = NSRange(location: open.range.location,
                                length: parsed.endOfClose - open.range.location)
             guard let swiftRange = Range(full, in: result) else { break }
@@ -1082,7 +1305,11 @@ struct BladeTranspiler {
                 token = ns.substring(with: m.range(at: 3)); isOpener = false
             }
 
-            if depth == 0 && token == closeToken {
+            // Blade compiles @endif/@endunless/@endisset/@endempty all to `endif;`, so
+            // they close each other's blocks in real templates. Accept the family.
+            let closes = ifFamilyClosers.contains(closeToken)
+                ? ifFamilyClosers.contains(token) : token == closeToken
+            if depth == 0 && closes {
                 let firstEnd = firstDividerStart ?? m.range.location
                 let first = ns.substring(with: NSRange(location: start, length: firstEnd - start))
                 var elseBranch: String? = nil
