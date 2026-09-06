@@ -18,10 +18,63 @@ struct TemplateResolver {
     }
 
     struct Result {
-        let html: String
+        /// The composed document with every heavy payload (inlined compiled CSS and
+        /// fonts, base64 images) replaced by a `QUICKBLADE_PAYLOAD_<n>` token. This is
+        /// what BladeTranspiler should run on: the payloads are megabytes of text that
+        /// contain no Blade, and scanning them with ~40 regex passes cost 60ms on an
+        /// empty partial and 2s on a page with 1MB of inlined images.
+        let parkedHTML: String
+        /// Payload `n` replaces the token `QUICKBLADE_PAYLOAD_n`.
+        let payloads: [String]
         let didResolveLayout: Bool
         let didInlineCSS: Bool
         let diagnostics: Diagnostics
+
+        /// The complete document, payloads spliced back in.
+        var html: String { TemplateResolver.splice(parkedHTML, payloads: payloads) }
+    }
+
+    /// Collects heavy payloads during resolution; see `Result.parkedHTML`. Reference
+    /// type for the same reason as `Diagnostics`.
+    final class Payloads {
+        private(set) var items: [String] = []
+
+        /// Stores `payload` and returns the token that stands in for it.
+        func park(_ payload: String) -> String {
+            items.append(payload)
+            return "\(payloadTokenPrefix)\(items.count - 1)"
+        }
+    }
+
+    static let payloadTokenPrefix = "QUICKBLADE_PAYLOAD_"
+
+    /// Replaces every `QUICKBLADE_PAYLOAD_<n>` token in `html` with `payloads[n]`.
+    /// Single forward pass: the payloads are large, so this must not become one
+    /// `replacingOccurrences` per payload over an ever-growing string.
+    static func splice(_ html: String, payloads: [String]) -> String {
+        guard !payloads.isEmpty else { return html }
+        var out = ""
+        out.reserveCapacity(html.utf8.count + payloads.reduce(0) { $0 + $1.utf8.count })
+        var rest = html[...]
+        while let tokenRange = rest.range(of: payloadTokenPrefix) {
+            out += rest[..<tokenRange.lowerBound]
+            var index = tokenRange.upperBound
+            var number = 0
+            var digits = 0
+            while index < rest.endIndex, rest[index].isASCII, let digit = rest[index].wholeNumberValue {
+                number = number * 10 + digit
+                digits += 1
+                index = rest.index(after: index)
+            }
+            if digits > 0, number < payloads.count {
+                out += payloads[number]
+            } else {
+                out += rest[tokenRange.lowerBound..<index]
+            }
+            rest = rest[index...]
+        }
+        out += rest
+        return out
     }
 
     // Balanced parentheses (3 levels) — reused for @vite() matching.
@@ -66,8 +119,8 @@ struct TemplateResolver {
             } catch {
                 // Other listing errors (volume gone, etc.) aren't the TCC story.
             }
-            return Result(html: source, didResolveLayout: false, didInlineCSS: false,
-                          diagnostics: diag)
+            return Result(parkedHTML: source, payloads: [], didResolveLayout: false,
+                          didInlineCSS: false, diagnostics: diag)
         }
         logger.info("Laravel root: \(projectRoot.path)")
 
@@ -91,19 +144,21 @@ struct TemplateResolver {
     /// project's compiled CSS so Tailwind/Flux utility classes actually apply. Mirrors the
     /// asset-inlining the layout path does, minus the @vite substitution (a bare page has none).
     private static func wrapBarePage(content: String, projectRoot: URL, diag: Diagnostics) -> Result {
+        let payloads = Payloads()
         var html = resolveIncludes(in: content, projectRoot: projectRoot)
         html = resolveComponents(in: html, projectRoot: projectRoot)
         html = resolveAssetEchoes(in: html)
 
-        let css = findCompiledCSS(projectRoot: projectRoot)
+        let css = compiledCSS(projectRoot: projectRoot)
         let faCSS = inlineFontAwesome(in: html, projectRoot: projectRoot)
         let styleBlock: String
         if let css = css {
-            let inlinedCSS = inlineCSSResources(css, projectRoot: projectRoot)
-            let darkModeBridge = buildDarkModeBridge(from: css)
-            styleBlock = "\(inlinedCSS)\n\(darkModeBridge)\n\(faCSS)\n\(barePageBaseCSS)"
+            let heavy = payloads.park("\(css.inlined)\n\(css.darkModeBridge)\n\(faCSS)")
+            styleBlock = "\(heavy)\n\(barePageBaseCSS)"
+        } else if !faCSS.isEmpty {
+            styleBlock = "\(payloads.park(faCSS))\n\(barePageBaseCSS)"
         } else {
-            styleBlock = "\(faCSS)\n\(barePageBaseCSS)"
+            styleBlock = barePageBaseCSS
         }
         // Class-gated dark rules in the inlined app CSS need the root element
         // marked (see darkModeClassBridgeScript) — pointless without app CSS.
@@ -129,9 +184,9 @@ struct TemplateResolver {
         </html>
         """
 
-        let withImages = inlineImages(document, projectRoot: projectRoot)
-        return Result(html: withImages, didResolveLayout: true, didInlineCSS: css != nil,
-                      diagnostics: diag)
+        let withImages = inlineImages(document, projectRoot: projectRoot, payloads: payloads)
+        return Result(parkedHTML: withImages, payloads: payloads.items, didResolveLayout: true,
+                      didInlineCSS: css != nil, diagnostics: diag)
     }
 
     // Layout/typography for the bare-page wrapper. Placed AFTER the inlined app CSS so these
@@ -148,14 +203,15 @@ struct TemplateResolver {
     """
 
     private static func postProcess(composed: String, projectRoot: URL, diag: Diagnostics) -> Result {
+        let payloads = Payloads()
         var html = resolveIncludes(in: composed, projectRoot: projectRoot)
         html = resolveComponents(in: html, projectRoot: projectRoot)
         html = resolveAssetEchoes(in: html)
-        let css = findCompiledCSS(projectRoot: projectRoot)
-        html = inlineAssets(html, css: css, projectRoot: projectRoot)
-        html = inlineImages(html, projectRoot: projectRoot)
-        return Result(html: html, didResolveLayout: true, didInlineCSS: css != nil,
-                      diagnostics: diag)
+        let css = compiledCSS(projectRoot: projectRoot)
+        html = inlineAssets(html, css: css, projectRoot: projectRoot, payloads: payloads)
+        html = inlineImages(html, projectRoot: projectRoot, payloads: payloads)
+        return Result(parkedHTML: html, payloads: payloads.items, didResolveLayout: true,
+                      didInlineCSS: css != nil, diagnostics: diag)
     }
 
     // MARK: - Path Containment
@@ -1651,11 +1707,78 @@ struct TemplateResolver {
             in: result, phpVars: phpVars, props: props, propDefaults: propDefaults)
     }
 
+    // MARK: - Compiled CSS (cached per project)
+
+    /// The project's compiled stylesheet, ready to inline.
+    struct CompiledCSS {
+        /// All `public/build/assets/*.css` concatenated, with local `url()` fonts and
+        /// images inlined as data URIs.
+        let inlined: String
+        /// `[data-theme=dark]` rules mirrored into `@media (prefers-color-scheme: dark)`.
+        let darkModeBridge: String
+        /// Whether the app styles a dark scheme at all (see `inlineAssets`).
+        let schemeAware: Bool
+    }
+
+    private struct CompiledCSSCacheEntry {
+        let fingerprint: [String]
+        let builtAt: Date
+        let css: CompiledCSS?
+    }
+
+    // The inlined stylesheet is identical for every view in a project (~2MB with
+    // fonts, ~35ms to rebuild), and the extension process outlives a single
+    // preview, so it is cached per project root. Invalidated when the set of CSS
+    // files, or any file's size or modification date, changes — a Vite rebuild
+    // does both. The age limit covers a font file appearing after the CSS did.
+    private static var compiledCSSCache: [String: CompiledCSSCacheEntry] = [:]
+    private static let compiledCSSCacheLock = NSLock()
+    private static let compiledCSSCacheMaxEntries = 4
+    private static let compiledCSSCacheMaxAge: TimeInterval = 10 * 60
+    /// Test hook: how many resolves were served from the cache.
+    static private(set) var compiledCSSCacheHits = 0
+
+    private static func compiledCSS(projectRoot: URL) -> CompiledCSS? {
+        let cssFiles = compiledCSSFiles(projectRoot: projectRoot)
+        let fingerprint = cssFiles.map { file -> String in
+            let values = try? file.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
+            let size = values?.fileSize ?? -1
+            let modified = values?.contentModificationDate?.timeIntervalSinceReferenceDate ?? -1
+            return "\(file.lastPathComponent):\(size):\(modified)"
+        }
+
+        compiledCSSCacheLock.lock()
+        defer { compiledCSSCacheLock.unlock() }
+        if let entry = compiledCSSCache[projectRoot.path],
+           entry.fingerprint == fingerprint,
+           Date().timeIntervalSince(entry.builtAt) < compiledCSSCacheMaxAge {
+            compiledCSSCacheHits += 1
+            return entry.css
+        }
+
+        let css = buildCompiledCSS(from: cssFiles, projectRoot: projectRoot)
+        if compiledCSSCache.count >= compiledCSSCacheMaxEntries {
+            compiledCSSCache.removeAll()
+        }
+        compiledCSSCache[projectRoot.path] = CompiledCSSCacheEntry(
+            fingerprint: fingerprint, builtAt: Date(), css: css)
+        return css
+    }
+
+    private static func buildCompiledCSS(from cssFiles: [URL], projectRoot: URL) -> CompiledCSS? {
+        guard let raw = findCompiledCSS(in: cssFiles) else { return nil }
+        return CompiledCSS(
+            inlined: inlineCSSResources(raw, projectRoot: projectRoot),
+            darkModeBridge: buildDarkModeBridge(from: raw),
+            schemeAware: raw.contains("prefers-color-scheme") || raw.contains(".dark"))
+    }
+
     // MARK: - Find Compiled CSS
 
     private static let maxTotalCSS = 8 * 1024 * 1024 // 8MB guard on total inlined CSS
 
-    private static func findCompiledCSS(projectRoot: URL) -> String? {
+    /// `public/build/assets/*.css`, alphabetical for a deterministic cascade.
+    private static func compiledCSSFiles(projectRoot: URL) -> [URL] {
         let assetsDir = projectRoot
             .appendingPathComponent("public")
             .appendingPathComponent("build")
@@ -1665,13 +1788,15 @@ struct TemplateResolver {
             at: assetsDir, includingPropertiesForKeys: nil
         ) else {
             logger.info("No build/assets directory found")
-            return nil
+            return []
         }
-
-        // Alphabetical for a deterministic cascade; per-file size check BEFORE
-        // reading so one giant file can neither blow memory nor bypass the cap.
-        let cssFiles = files.filter { $0.pathExtension == "css" }
+        return files.filter { $0.pathExtension == "css" }
             .sorted { $0.lastPathComponent < $1.lastPathComponent }
+    }
+
+    private static func findCompiledCSS(in cssFiles: [URL]) -> String? {
+        // Per-file size check BEFORE reading so one giant file can neither blow
+        // memory nor bypass the cap.
         var allCSS = ""
         var totalBytes = 0
         var inlinedCount = 0
@@ -1870,7 +1995,8 @@ struct TemplateResolver {
         return result
     }
 
-    private static func inlineAssets(_ html: String, css: String?, projectRoot: URL) -> String {
+    private static func inlineAssets(_ html: String, css: CompiledCSS?, projectRoot: URL,
+                                     payloads: Payloads) -> String {
         var result = html
 
         // Replace first @vite(...) with inlined <style>, strip the rest
@@ -1893,21 +2019,21 @@ struct TemplateResolver {
                 let faCSS = inlineFontAwesome(in: result, projectRoot: projectRoot)
                 let replacement: String
                 if let css = css {
-                    let inlinedCSS = inlineCSSResources(css, projectRoot: projectRoot)
-                    let darkModeBridge = buildDarkModeBridge(from: css)
                     // Declare the colour scheme so WebKit paints a dark canvas in dark mode
                     // instead of flashing white until a body background lands — but only
                     // for a scheme-aware app: under color-scheme:dark the UA default text is
                     // white, and a light-only app with no explicit body colour would render
                     // white on white. Skip the meta if the layout already carries one.
-                    let schemeAware = css.contains("prefers-color-scheme") || css.contains(".dark")
                     let hasMeta = result.range(of: #"<meta\s[^>]*name\s*=\s*["']color-scheme["']"#,
                                                options: .regularExpression) != nil
-                    let schemeMeta = schemeAware && !hasMeta ? colorSchemeMeta + "\n" : ""
-                    let schemeCSS = schemeAware ? colorSchemeCSS + "\n" : ""
-                    replacement = "\(schemeMeta)<style>\n\(inlinedCSS)\n\(darkModeBridge)\n\(faCSS)\n\(jsFrameworkDefaults)\n\(schemeCSS)</style>\n\(darkModeClassBridgeScript)"
+                    let schemeMeta = css.schemeAware && !hasMeta ? colorSchemeMeta + "\n" : ""
+                    let schemeCSS = css.schemeAware ? colorSchemeCSS + "\n" : ""
+                    let heavy = payloads.park("\(css.inlined)\n\(css.darkModeBridge)\n\(faCSS)")
+                    replacement = "\(schemeMeta)<style>\n\(heavy)\n\(jsFrameworkDefaults)\n\(schemeCSS)</style>\n\(darkModeClassBridgeScript)"
+                } else if !faCSS.isEmpty {
+                    replacement = "<style>\n\(payloads.park(faCSS))\n\(jsFrameworkDefaults)\n</style>"
                 } else {
-                    replacement = "<style>\n\(faCSS)\n\(jsFrameworkDefaults)\n</style>"
+                    replacement = "<style>\n\(jsFrameworkDefaults)\n</style>"
                 }
 
                 // Replace in reverse: first match gets CSS, rest get stripped
@@ -2032,7 +2158,7 @@ struct TemplateResolver {
         "webp": "image/webp",
     ]
 
-    private static func inlineImages(_ html: String, projectRoot: URL) -> String {
+    private static func inlineImages(_ html: String, projectRoot: URL, payloads: Payloads) -> String {
         // Group 1: double-quoted src value; group 2: single-quoted.
         guard let imgRegex = try? NSRegularExpression(
             pattern: #"<img[^>]+src\s*=\s*(?:"([^"]*)"|'([^']*)')"#,
@@ -2091,7 +2217,7 @@ struct TemplateResolver {
             }
 
             let dataURI = "data:\(mime);base64,\(payload.base64EncodedString())"
-            result = result.replacingCharacters(in: srcRange, with: dataURI)
+            result = result.replacingCharacters(in: srcRange, with: payloads.park(dataURI))
             inlinedCount += 1
         }
 

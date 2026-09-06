@@ -51,9 +51,17 @@ struct BladeTranspiler {
     /// `x-cloak` is removed outright, as Alpine does on init: apps ship
     /// `[x-cloak]{display:none!important}` in their own compiled CSS, which no preview
     /// stylesheet can override, and at rest a cloaked element is visible.
+    ///
+    /// Both patterns open on the attribute name, and `removeWithLeadingWhitespace`
+    /// swallows the whitespace before it. They used to open with `\s+`: by this
+    /// phase the stripped directives have left long runs of indentation, and that
+    /// retried from every position of a run, backtracking the whole run each time
+    /// (20,000 spaces: 23s per pass; a real 110KB page spent 209ms here). The
+    /// lookbehind keeps the old requirement that whitespace precede the name, so
+    /// `data-x-show` is still not a match.
     private static func resolveAlpineRestingState(_ source: String) -> String {
-        var result = regexReplace(source, pattern: #"\s+x-show\s*=\s*(?:"\s*!(?!=)[^"]*"|'\s*!(?!=)[^']*')"#, with: "")
-        result = regexReplace(result, pattern: #"\s+x-cloak(?:\s*=\s*(?:"[^"]*"|'[^']*'))?(?=[\s/>])"#, with: "")
+        var result = removeWithLeadingWhitespace(source, pattern: #"(?<=\s)x-show\s*=\s*(?:"\s*!(?!=)[^"]*"|'\s*!(?!=)[^']*')"#)
+        result = removeWithLeadingWhitespace(result, pattern: #"(?<=\s)x-cloak(?:\s*=\s*(?:"[^"]*"|'[^']*'))?(?=[\s/>])"#)
         return result
     }
 
@@ -1372,23 +1380,71 @@ struct BladeTranspiler {
     }
 
     /// Replaces matches using a closure that receives the captured groups (index 0 = full match).
-    /// Processes matches in reverse so earlier ranges stay valid as the string is mutated.
     private static func regexReplaceWithBlock(_ source: String, pattern: String, transform: (_ captures: [String]) -> String) -> String {
         guard let regex = cachedRegex(pattern) else { return source }
         let ns = source as NSString
         let matches = regex.matches(in: source, options: [], range: NSRange(location: 0, length: ns.length))
         guard !matches.isEmpty else { return source }
 
-        var result = source
-        for match in matches.reversed() {
-            guard let fullRange = Range(match.range, in: result) else { continue }
+        return rebuild(ns, matches: matches) { match in
             var captures: [String] = []
             for i in 0..<match.numberOfRanges {
                 let r = match.range(at: i)
                 captures.append(r.location == NSNotFound ? "" : ns.substring(with: r))
             }
-            result.replaceSubrange(fullRange, with: transform(captures))
+            return (match.range, transform(captures))
         }
-        return result
+    }
+
+    /// Rebuilds `source` in ONE forward pass: the text between matches is copied
+    /// through, and each match's `range` (which `replacement` may widen, e.g. to
+    /// swallow leading whitespace) is swapped for its text. Ranges must be
+    /// ascending and non-overlapping, as `matches(in:)` returns them.
+    ///
+    /// This replaces the old "reverse the matches, `Range(match.range, in:)` +
+    /// `replaceSubrange` each" loop. That was O(matches x n) on any text with a
+    /// single non-ASCII character: Swift maps UTF-16 offsets to indices through a
+    /// breadcrumb table it throws away on every mutation, so each conversion
+    /// re-walked the string. 161 `<flux:*>` tags on a 110KB page: 1ms to match,
+    /// 28ms to replace. (Pure ASCII maps offsets for free, which is why the cost
+    /// never showed on fixtures.)
+    static func rebuild(_ ns: NSString, matches: [NSTextCheckingResult],
+                        replacement: (NSTextCheckingResult) -> (range: NSRange, text: String)) -> String {
+        var out = ""
+        var cursor = 0
+        for match in matches {
+            let (range, text) = replacement(match)
+            guard range.location >= cursor else { continue }
+            out += ns.substring(with: NSRange(location: cursor, length: range.location - cursor))
+            out += text
+            cursor = range.location + range.length
+        }
+        out += ns.substring(from: cursor)
+        return out
+    }
+
+    /// Removes each match of `pattern` together with the run of whitespace before it.
+    /// The pattern should open on a literal (`x-show`, `x-cloak`) so ICU's first-
+    /// character scan applies; the whitespace is swallowed here instead of by a
+    /// leading `\s+`, which had no such scan and retried from every position of an
+    /// indentation run (20,000 spaces: 23s per pass; a real page: 209ms).
+    private static func removeWithLeadingWhitespace(_ source: String, pattern: String) -> String {
+        guard let regex = cachedRegex(pattern) else { return source }
+        let ns = source as NSString
+        let matches = regex.matches(in: source, options: [], range: NSRange(location: 0, length: ns.length))
+        guard !matches.isEmpty else { return source }
+
+        var cursor = 0
+        return rebuild(ns, matches: matches) { match in
+            var start = match.range.location
+            while start > cursor, isWhitespace(ns.character(at: start - 1)) { start -= 1 }
+            cursor = match.range.location + match.range.length
+            return (NSRange(location: start, length: cursor - start), "")
+        }
+    }
+
+    private static func isWhitespace(_ unit: unichar) -> Bool {
+        guard let scalar = Unicode.Scalar(unit) else { return false }
+        return CharacterSet.whitespacesAndNewlines.contains(scalar)
     }
 }

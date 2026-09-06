@@ -749,4 +749,24 @@ final class BladeTranspilerTests: XCTestCase {
             .first { $0.hasPrefix("[data-flux-navbar-item]{") }
         XCTAssertTrue(rule?.contains("position:relative") ?? false, "got: \(rule ?? "no rule")")
     }
+
+    // MARK: - Payload tokens
+
+    // TemplateResolver parks inlined CSS/fonts/images behind tokens so the regex
+    // phases never scan megabytes of base64 (see its "Heavy payload parking" tests).
+    // Those tokens sit in attribute values and inside <style>; every phase must
+    // pass them through untouched or the splice afterwards leaves holes.
+    func testPayloadTokensSurviveTranspile() {
+        let src = """
+        <head><style>
+        QUICKBLADE_PAYLOAD_0
+        </style></head>
+        @if($ok)<img src="QUICKBLADE_PAYLOAD_1" class="{{ $cls }}" alt="">@endif
+        @foreach($items as $item)<img src='QUICKBLADE_PAYLOAD_12'>@endforeach
+        """
+        let out = BladeTranspiler.transpile(src)
+        XCTAssertTrue(out.contains("QUICKBLADE_PAYLOAD_0"), "style token lost: \(out)")
+        XCTAssertTrue(out.contains(#"src="QUICKBLADE_PAYLOAD_1""#), "img token lost: \(out)")
+        XCTAssertTrue(out.contains("QUICKBLADE_PAYLOAD_12"), "loop-body token lost: \(out)")
+    }
 }

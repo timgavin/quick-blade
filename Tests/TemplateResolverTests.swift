@@ -700,4 +700,83 @@ final class TemplateResolverTests: XCTestCase {
             files: ["resources/views/components/layouts/app.blade.php": layout])
         XCTAssertTrue(result.html.contains("class=\"max-w-7xl\""), "got: \(result.html)")
     }
+
+    // MARK: - Heavy payload parking
+
+    // Inlined compiled CSS, fonts and images run to megabytes and contain no Blade.
+    // Every regex pass in BladeTranspiler that touched them cost tens of ms (2s on a
+    // page with 1MB of inlined images), so the resolver keeps them OUT of the string
+    // the transpiler sees: `parkedHTML` holds a token per payload and `html` splices
+    // them back. PreviewProvider transpiles the parked form and splices afterwards.
+    func testHeavyPayloadsAreParkedOutOfTheTranspiledHTML() throws {
+        let project = try FixtureProject()
+        try project.write("resources/views/components/layouts/app.blade.php",
+            "<!DOCTYPE html><html><head>@vite(['resources/css/app.css'])</head><body>{{ $slot }}</body></html>")
+        try project.write("public/build/assets/app-abc123.css",
+            ".hero{background:url(/images/bg.png)} .qb-unique-rule{color:red}")
+        try project.write("public/images/bg.png", data: Self.tinyPNG)
+        try project.write("public/images/logo.png", data: Self.tinyPNG)
+        let page = #"<x-layouts.app><img src="/images/logo.png"></x-layouts.app>"#
+        let pageURL = try project.write("resources/views/pages/test.blade.php", page)
+        let result = TemplateResolver.resolve(source: page, fileURL: pageURL)
+
+        XCTAssertFalse(result.parkedHTML.contains("base64,"), "image/font bytes leaked into parkedHTML")
+        XCTAssertFalse(result.parkedHTML.contains(".qb-unique-rule"), "compiled CSS leaked into parkedHTML")
+        XCTAssertTrue(result.parkedHTML.contains("QUICKBLADE_PAYLOAD_"), "no payload token in parkedHTML")
+        XCTAssertGreaterThanOrEqual(result.payloads.count, 2, "expected CSS and image payloads")
+
+        XCTAssertTrue(result.html.contains(".qb-unique-rule"))
+        XCTAssertTrue(result.html.contains("url(data:image/png;base64,"))
+        XCTAssertTrue(result.html.contains(#"src="data:image/png;base64,"#))
+        XCTAssertFalse(result.html.contains("QUICKBLADE_PAYLOAD_"), "token survived splicing")
+        XCTAssertEqual(TemplateResolver.splice(result.parkedHTML, payloads: result.payloads), result.html)
+    }
+
+    func testBarePagePayloadsAreParked() throws {
+        let project = try FixtureProject()
+        try project.write("public/build/assets/app-abc123.css", ".qb-unique-rule{color:red}")
+        try project.write("public/images/logo.png", data: Self.tinyPNG)
+        let page = #"<div><img src="/images/logo.png"></div>"#
+        let pageURL = try project.write("resources/views/livewire/widget.blade.php", page)
+        let result = TemplateResolver.resolve(source: page, fileURL: pageURL)
+
+        XCTAssertTrue(result.didResolveLayout)
+        XCTAssertFalse(result.parkedHTML.contains("base64,"))
+        XCTAssertFalse(result.parkedHTML.contains(".qb-unique-rule"))
+        XCTAssertTrue(result.html.contains(".qb-unique-rule"))
+        XCTAssertTrue(result.html.contains(#"src="data:image/png;base64,"#))
+        XCTAssertFalse(result.html.contains("QUICKBLADE_PAYLOAD_"))
+    }
+
+    func testSpliceWithNoPayloadsIsIdentity() {
+        XCTAssertEqual(TemplateResolver.splice("<p>x</p>", payloads: []), "<p>x</p>")
+    }
+
+    // MARK: - Compiled CSS cache
+
+    // The inlined compiled CSS (with its fonts) is identical for every view in a
+    // project, and the extension process outlives a single preview, so rebuilding it
+    // from disk per file (~35ms) is wasted. It is cached per project and invalidated
+    // when any compiled CSS file's size or modification date changes.
+    func testCompiledCSSIsCachedUntilTheBuildChanges() throws {
+        let project = try FixtureProject()
+        let cssURL = try project.write("public/build/assets/app-abc123.css", ".v1{color:red}")
+        let page = "<div>x</div>"
+        let pageURL = try project.write("resources/views/livewire/widget.blade.php", page)
+
+        let first = TemplateResolver.resolve(source: page, fileURL: pageURL)
+        XCTAssertTrue(first.html.contains(".v1{color:red}"))
+        let hitsBefore = TemplateResolver.compiledCSSCacheHits
+        let second = TemplateResolver.resolve(source: page, fileURL: pageURL)
+        XCTAssertEqual(TemplateResolver.compiledCSSCacheHits, hitsBefore + 1, "second resolve should hit the cache")
+        XCTAssertEqual(second.html, first.html)
+
+        // A rebuilt stylesheet (new size + mtime) must be picked up, not served stale.
+        try ".v2-rebuilt{color:blue}".data(using: .utf8)!.write(to: cssURL)
+        let future = Date().addingTimeInterval(5)
+        try FileManager.default.setAttributes([.modificationDate: future], ofItemAtPath: cssURL.path)
+        let third = TemplateResolver.resolve(source: page, fileURL: pageURL)
+        XCTAssertTrue(third.html.contains(".v2-rebuilt"), "stale CSS served after rebuild")
+        XCTAssertFalse(third.html.contains(".v1{color:red}"))
+    }
 }

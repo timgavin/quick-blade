@@ -51,7 +51,10 @@ class PreviewProvider: QLPreviewProvider, QLPreviewingController {
 
             if resolved.didResolveLayout {
                 logger.info("Template resolved (CSS inlined: \(resolved.didInlineCSS))")
-                html = BladeTranspiler.transpile(resolved.html)
+                // Transpile the parked form (heavy CSS/font/image payloads swapped for
+                // tokens), then splice the payloads back — see Result.parkedHTML.
+                html = TemplateResolver.splice(
+                    BladeTranspiler.transpile(resolved.parkedHTML), payloads: resolved.payloads)
             } else {
                 logger.info("No layout found, using single-file fallback")
                 let transpiled = BladeTranspiler.transpile(source)

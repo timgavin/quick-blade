@@ -294,6 +294,48 @@ final class ResourceLimitTests: XCTestCase {
                           "dynamic img src replacement is quadratic again (\(seconds)s)")
     }
 
+    // MARK: - Long whitespace runs (was O(n^2) per run: 20,000 spaces took 23s per pass)
+
+    /// Stripping directives leaves runs of indentation behind, and a pattern that
+    /// OPENS with `\s+` retries from every position inside such a run, backtracking
+    /// the whole run each time. A real 110KB page spent 209ms in one such pass.
+    func testLongWhitespaceRunsTranspileInReasonableTime() {
+        let source = "<div>" + String(repeating: " ", count: 20_000)
+            + "<p x-show=\"!open\">a</p><p x-cloak>b</p></div>"
+
+        var out = ""
+        let seconds = elapsed { out = BladeTranspiler.transpile(source) }
+        XCTAssertLessThan(seconds, 2.0,
+                          "whitespace-leading regex is quadratic again (\(seconds)s)")
+        XCTAssertFalse(out.contains("x-show"), "negated x-show should still be stripped: \(out.suffix(80))")
+        XCTAssertFalse(out.contains("x-cloak"), "x-cloak should still be stripped: \(out.suffix(80))")
+    }
+
+    // MARK: - Many block-replaced matches (was O(matches x n): 28ms per pass on a real page)
+
+    /// `<flux:*>` tags are rewritten through a closure per match. Mutating the string
+    /// once per match re-walks it every time (Swift rebuilds its UTF-16 offset index
+    /// after each edit), so doubling the tag count should roughly double the cost,
+    /// not quadruple it. Same threshold logic as the echo test above.
+    ///
+    /// The filler carries ONE non-ASCII character on purpose: for pure-ASCII text
+    /// Swift maps UTF-16 offsets to indices for free, and the quadratic path never
+    /// runs. A real page needs only a curly quote or an arrow to hit it (161 tags
+    /// on a 110KB page: 1ms to match, 28ms to replace).
+    func testFluxTagRewriteCostGrowsRoughlyLinearly() {
+        func cost(_ n: Int) -> TimeInterval {
+            var source = "<p>\u{2192}</p>\n"
+            for i in 0..<n { source += "<flux:button variant=\"primary\">b\(i)</flux:button> filler filler\n" }
+            return elapsed { _ = BladeTranspiler.transpile(source) }
+        }
+        _ = cost(500)                           // warm caches, ignore
+        let small = cost(2000)
+        let large = cost(4000)
+        let ratio = large / max(small, 0.001)
+        XCTAssertLessThan(ratio, 3.5,
+                          "doubling <flux:*> tags multiplied cost by \(ratio)x — expected ~2x, quadratic would be ~4x")
+    }
+
     /// Doubling echo count should roughly double the work, not quadruple it.
     func testTranspileCostGrowsRoughlyLinearlyWithEchoes() {
         func cost(_ n: Int) -> TimeInterval {
